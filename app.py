@@ -785,9 +785,9 @@ def judge_repair(job_id, before_analysis, after_analysis, repairs, duration):
 # ──────────────────────────────────────────────
 def mesh_to_json(mesh):
     """Convert trimesh to JSON-serializable format for Three.js"""
-    vertices = mesh.vertices.flatten().tolist()
+    vertices = np.round(mesh.vertices.flatten(), 5).tolist()
     face_normals = mesh.face_normals
-    normals = np.repeat(face_normals, 3, axis=0).flatten().tolist()
+    normals = np.round(np.repeat(face_normals, 3, axis=0).flatten(), 4).tolist()
     indices = mesh.faces.flatten().tolist()
 
     return {
@@ -911,12 +911,15 @@ def analyze_printability(mesh, build_direction='z', printer_profile=None):
             measured_scores = thickness_scores[measured_mask]
             unmeasured_indices = np.where(~measured_mask)[0]
 
-            # For unmeasured faces, use average of nearest measured faces
-            for ui in unmeasured_indices[:min(len(unmeasured_indices), 5000)]:
-                centroid = mesh.triangles_center[ui]
-                dists = np.linalg.norm(measured_centroids - centroid, axis=1)
-                nearest = np.argsort(dists)[:3]
-                thickness_scores[ui] = np.mean(measured_scores[nearest])
+            # Cap propagation to avoid memory issues on large meshes
+            prop_limit = min(len(unmeasured_indices), 2000)
+            if prop_limit > 0:
+                sample_unmeasured = np.random.choice(unmeasured_indices, prop_limit, replace=False) if len(unmeasured_indices) > prop_limit else unmeasured_indices
+                for ui in sample_unmeasured:
+                    centroid = mesh.triangles_center[ui]
+                    dists = np.linalg.norm(measured_centroids - centroid, axis=1)
+                    nearest = np.argsort(dists)[:3]
+                    thickness_scores[ui] = np.mean(measured_scores[nearest])
 
     except Exception as e:
         logger.warning(f"Wall thickness analysis failed: {e}")
@@ -955,25 +958,34 @@ def analyze_printability(mesh, build_direction='z', printer_profile=None):
     )
 
     # ═══ PER-FACE COLORS (RGB) ═══
-    # Green (safe) → Yellow (warning) → Red (fail)
+    # Green (safe) → Yellow (warning) → Red (fail) — vectorized
     colors = np.zeros((n_faces, 3))
-    for i in range(n_faces):
-        s = composite[i]
-        if s < 0.3:
-            # Green to yellow-green
-            t = s / 0.3
-            colors[i] = [t * 0.9, 0.85 + t * 0.15, 0.1 * (1 - t)]
-        elif s < 0.6:
-            # Yellow-green to orange
-            t = (s - 0.3) / 0.3
-            colors[i] = [0.9 + t * 0.1, 1.0 - t * 0.4, 0]
-        else:
-            # Orange to red
-            t = (s - 0.6) / 0.4
-            colors[i] = [1.0, 0.6 * (1 - t), 0]
+    
+    # Green to yellow-green (s < 0.3)
+    m1 = composite < 0.3
+    t1 = composite[m1] / 0.3
+    colors[m1, 0] = t1 * 0.9
+    colors[m1, 1] = 0.85 + t1 * 0.15
+    colors[m1, 2] = 0.1 * (1 - t1)
+    
+    # Yellow-green to orange (0.3 <= s < 0.6)
+    m2 = (composite >= 0.3) & (composite < 0.6)
+    t2 = (composite[m2] - 0.3) / 0.3
+    colors[m2, 0] = 0.9 + t2 * 0.1
+    colors[m2, 1] = 1.0 - t2 * 0.4
+    colors[m2, 2] = 0
+    
+    # Orange to red (s >= 0.6)
+    m3 = composite >= 0.6
+    t3 = (composite[m3] - 0.6) / 0.4
+    colors[m3, 0] = 1.0
+    colors[m3, 1] = 0.6 * (1 - t3)
+    colors[m3, 2] = 0
 
     # Per-vertex colors (3 verts per face for flat shading)
-    vertex_colors = np.repeat(colors, 3, axis=0).flatten().tolist()
+    # Round to 3 decimal places to reduce JSON size
+    vertex_colors = np.round(np.repeat(colors, 3, axis=0).flatten(), 3).tolist()
+    del colors  # free memory
 
     # ═══ CATEGORY MASKS ═══
     # For frontend toggles — which faces have which issue type
@@ -1508,15 +1520,49 @@ def printability(job_id):
 
     try:
         mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+        
+        # Decimate large meshes to avoid OOM on heatmap computation
+        MAX_HEATMAP_FACES = 200000
+        decimated = False
+        decimated_mesh_data = None
+        if len(mesh.faces) > MAX_HEATMAP_FACES:
+            original_faces = len(mesh.faces)
+            logger.info(f"Decimating {original_faces} faces to {MAX_HEATMAP_FACES} for heatmap")
+            try:
+                decimated_mesh = mesh.simplify_quadric_decimation(MAX_HEATMAP_FACES)
+                if decimated_mesh is not None and len(decimated_mesh.faces) > 1000:
+                    mesh = decimated_mesh
+                    decimated = True
+                    decimated_mesh_data = mesh_to_json(mesh)
+                    logger.info(f"Decimated to {len(mesh.faces)} faces")
+            except Exception as e:
+                logger.warning(f"Quadric decimation failed: {e}, trying face subsampling")
+                try:
+                    # Fallback: subsample faces
+                    keep = np.sort(np.random.choice(len(mesh.faces), MAX_HEATMAP_FACES, replace=False))
+                    submesh = mesh.submesh([keep], append=True)
+                    if submesh is not None and len(submesh.faces) > 1000:
+                        mesh = submesh
+                        decimated = True
+                        decimated_mesh_data = mesh_to_json(mesh)
+                        logger.info(f"Subsampled to {len(mesh.faces)} faces")
+                except Exception as e2:
+                    logger.warning(f"Face subsampling also failed: {e2}, running on full mesh")
+        
         result = analyze_printability(mesh, build_direction, printer_profile)
 
-        return jsonify({
+        resp = {
             'job_id': job_id,
             'printability': result['summary'],
             'vertex_colors': result['vertex_colors'],
             'composite_scores': result['composite_scores'],
             'category_masks': result['category_masks']
-        })
+        }
+        if decimated and decimated_mesh_data:
+            resp['decimated_mesh'] = decimated_mesh_data
+            resp['decimated'] = True
+        
+        return jsonify(resp)
 
     except Exception as e:
         logger.error(f"Printability analysis failed for {job_id}: {e}")

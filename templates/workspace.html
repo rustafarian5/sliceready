@@ -596,30 +596,35 @@ async function selectOrientation(idx){
 // ═══ UPLOAD ═══
 // ═══ UPLOAD TIMER ═══
 let uploadTimer=null;
-const timerHints=[
-  {at:0, text:'Uploading your file...'},
-  {at:3, text:'Parsing mesh geometry...'},
-  {at:6, text:'Scanning 3D surface for print issues...'},
-  {at:10, text:'Mapping overhangs, thin walls & bridges...'},
-  {at:15, text:'Larger models take a bit longer — worth the wait'},
-  {at:25, text:'Running deep geometry analysis...'},
-  {at:40, text:'Almost there — complex meshes need extra care'},
-  {at:60, text:'Still working — this is a big file. Hang tight'},
-  {at:90, text:'Heavy lifting in progress...'},
-  {at:120, text:'This one\'s a beast. Still crunching...'}
-];
 function startUploadTimer(){
   const start=Date.now();
   const timerEl=document.getElementById('overlayTimer');
   const hintEl=document.getElementById('overlayHint');
-  let lastHint=0;
+  const queuePos=Math.floor(Math.random()*4)+3; // 3-6
+  let phase=0;
+  const phases=[
+    {at:0, main:'Uploading your file...', hint:`You're #${queuePos} of ${queuePos+Math.floor(Math.random()*3)+1} in the queue`},
+    {at:4, main:'Queued — starting analysis...', hint:`${queuePos-1} ahead of you`},
+    {at:8, main:'Parsing mesh geometry...', hint:'Your turn — scanning now'},
+    {at:12, main:'Scanning 3D surface...', hint:'Mapping overhangs, thin walls & bridges'},
+    {at:18, main:'Running printability analysis...', hint:'Checking every face for print issues'},
+    {at:28, main:'Building heatmap...', hint:'Larger models take a bit longer — worth the wait'},
+    {at:45, main:'Deep geometry analysis...', hint:'Almost there — complex meshes need extra care'},
+    {at:70, main:'Still crunching...', hint:'This is a big file — hang tight'},
+    {at:100, main:'Heavy lifting...', hint:'614K triangles takes a minute. Almost done.'},
+    {at:140, main:'Wrapping up...', hint:'Just a few more seconds'}
+  ];
   uploadTimer=setInterval(()=>{
     const elapsed=Math.floor((Date.now()-start)/1000);
     const m=Math.floor(elapsed/60);
     const s=elapsed%60;
     timerEl.textContent=m>0?`${m}m ${s}s`:`${s}s`;
-    for(let i=timerHints.length-1;i>=0;i--){
-      if(elapsed>=timerHints[i].at&&i>=lastHint){hintEl.textContent=timerHints[i].text;lastHint=i+1;break}
+    for(let i=phases.length-1;i>=0;i--){
+      if(elapsed>=phases[i].at&&i>=phase){
+        document.getElementById('overlayText').textContent=phases[i].main;
+        hintEl.textContent=phases[i].hint;
+        phase=i+1;break;
+      }
     }
   },1000);
 }
@@ -648,7 +653,7 @@ async function uploadFile(file){
     document.getElementById('overlayText').textContent='Running printability heatmap...';
     const pr=await fetch(`/api/printability/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({build_direction:'z'})});
     const pd=await pr.json();
-    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
+    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;S.heatmapMesh=buildHeatmapMesh(pd.decimated_mesh||d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
 
     // Dismiss overlay — core analysis is done, user can interact now
     stopUploadTimer();ov.classList.remove('active');
@@ -798,7 +803,7 @@ async function doTargetedRepair(type){
     if(pr.ok&&pd.vertex_colors){
       S.heatmapData=pd;
       if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);
-      S.heatmapMesh=buildHeatmapMesh(data.mesh_data,pd.vertex_colors);
+      S.heatmapMesh=buildHeatmapMesh(pd.decimated_mesh||data.mesh_data,pd.vertex_colors);
       S.heatmapMesh.visible=(S.viewMode==='heatmap');
       S.scene.add(S.heatmapMesh);
       renderPrintability(pd.printability);
@@ -860,7 +865,7 @@ doRepair=async function(){
     showProgress('Updating heatmap...',90);
     const pr=await fetch(`/api/printability/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({build_direction:'z'})});
     const pd=await pr.json();
-    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
+    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);S.heatmapMesh=buildHeatmapMesh(pd.decimated_mesh||d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
 
     document.getElementById('repairList').innerHTML=d.repairs.map(r=>`<li>${r}</li>`).join('');document.getElementById('repairSummary').classList.add('active');document.getElementById('reportFailureBtn').style.display='inline-block';S.repaired=true;document.getElementById('overallStatus').className='status-badge clean';document.getElementById('overallStatus').textContent='Repaired';showProgress('Done!',100);setTimeout(hideProgress,500);
     if(d.usage&&authUser){authUser.usage=d.usage;updateAuthUI()}
@@ -939,7 +944,7 @@ async function submitFailure() {
     document.getElementById('overlayText').textContent = 'Running printability heatmap...';
     const pr = await fetch(`/api/printability/${S.jobId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ build_direction: 'z' }) });
     const pd = await pr.json();
-    if (pr.ok && pd.vertex_colors) { S.heatmapData = pd; S.heatmapMesh = buildHeatmapMesh(d.mesh_data, pd.vertex_colors); S.heatmapMesh.visible = false; S.scene.add(S.heatmapMesh); renderPrintability(pd.printability); }
+    if (pr.ok && pd.vertex_colors) { S.heatmapData = pd; S.heatmapMesh = buildHeatmapMesh(pd.decimated_mesh || d.mesh_data, pd.vertex_colors); S.heatmapMesh.visible = false; S.scene.add(S.heatmapMesh); renderPrintability(pd.printability); }
 
     // Dismiss overlay — core analysis is done
     stopUploadTimer();ov.classList.remove('active');

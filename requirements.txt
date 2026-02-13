@@ -7,3 +7,4 @@ numpy==2.2.3
 stripe==11.4.1
 rtree==1.4.1
 networkx==3.2.1
+fast-simplification==0.1.13

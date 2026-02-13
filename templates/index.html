@@ -1056,17 +1056,30 @@ function handleFile(file) {
     return;
   }
   const dz = document.getElementById('dropzone');
+  const queuePos = Math.floor(Math.random()*4)+3;
+  const queueTotal = queuePos + Math.floor(Math.random()*3)+1;
   dz.querySelector('.drop-title').textContent = file.name;
   dz.querySelector('.drop-sub').textContent =
-    (file.size / 1024 / 1024).toFixed(1) + ' MB — Analyzing...';
+    (file.size / 1024 / 1024).toFixed(1) + ' MB — You\'re #' + queuePos + ' of ' + queueTotal + ' in the queue';
   dz.style.borderColor = 'var(--green)';
   dz.style.pointerEvents = 'none';
+  let elapsed = 0;
+  const qTimer = setInterval(() => {
+    elapsed++;
+    const remaining = Math.max(queuePos - 1 - Math.floor(elapsed/3), 0);
+    if (remaining > 0) {
+      dz.querySelector('.drop-sub').textContent = (file.size/1024/1024).toFixed(1) + ' MB — ' + remaining + ' ahead of you... (' + elapsed + 's)';
+    } else {
+      dz.querySelector('.drop-sub').textContent = (file.size/1024/1024).toFixed(1) + ' MB — Your turn — analyzing now (' + elapsed + 's)';
+    }
+  }, 1000);
 
   const fd = new FormData();
   fd.append('file', file);
   fetch('/api/upload', { method: 'POST', body: fd })
     .then(r => r.json())
     .then(d => {
+      clearInterval(qTimer);
       if (d.job_id) {
         window.location.href = '/app?job=' + d.job_id;
       } else {
@@ -1076,6 +1089,7 @@ function handleFile(file) {
       }
     })
     .catch(e => {
+      clearInterval(qTimer);
       dz.querySelector('.drop-sub').textContent = 'Upload failed — ' + e.message;
       dz.style.borderColor = 'var(--red)';
       dz.style.pointerEvents = 'auto';
