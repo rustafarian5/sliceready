@@ -145,7 +145,7 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
 .orient-loading{text-align:center;padding:20px;color:var(--text-muted);font-size:12px}
 .orient-loading .spinner{margin:0 auto 8px}
 /* ── Repair Section ── */
-.repair-section{padding:20px;margin-top:auto;border-top:1px solid var(--border)}
+.repair-section{padding:20px;border-bottom:1px solid var(--border)}
 .progress-container{display:none;margin-bottom:16px}.progress-container.active{display:block}
 .progress-bar-bg{height:4px;background:var(--surface-2);border-radius:2px;overflow:hidden;margin-bottom:8px}
 .progress-bar-fill{height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width .5s ease}
@@ -328,7 +328,6 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
     </div>
 
     <div class="panel-section"><div class="section-header"><span class="section-title">Mesh Analysis</span><span class="status-badge scanning" id="overallStatus">Uploading...</span></div><div class="stats-grid" id="statsGrid"></div></div>
-    <div class="panel-section"><div class="section-header"><span class="section-title">Issues</span><span id="issueCount" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-muted)"></span></div><div class="issue-list" id="issueList"><div class="issue-card"><div class="issue-icon warn">⏳</div><div class="issue-info"><h4>Analyzing...</h4><p>Running mesh analysis.</p></div></div></div></div>
 
     <div class="repair-section">
       <div class="progress-container" id="progressContainer"><div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div><div class="progress-label" id="progressLabel"></div></div>
@@ -360,6 +359,8 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
       </div>
       <span class="free-label" id="freeLabel"></span>
     </div>
+
+    <div class="panel-section"><div class="section-header"><span class="section-title">Issues</span><span id="issueCount" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-muted)"></span></div><div class="issue-list" id="issueList"><div class="issue-card"><div class="issue-icon warn">⏳</div><div class="issue-info"><h4>Analyzing...</h4><p>Running mesh analysis.</p></div></div></div></div>
   </div>
 </div>
 <div class="upload-overlay" id="uploadOverlay"><div class="spinner"></div><p id="overlayText">Uploading & analyzing...</p><div class="sub">Running heatmap + auto-orient</div></div>
@@ -629,33 +630,33 @@ async function uploadFile(file){
     const pd=await pr.json();
     if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
 
-    // Run auto-orient (parallel feel — show results as they come)
-    document.getElementById('overlayText').textContent='Finding best print orientation...';
-    document.getElementById('orientSection').style.display='block';
-    const or=await fetch(`/api/orient/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-    const od=await or.json();
+    // Dismiss overlay — core analysis is done, user can interact now
     ov.classList.remove('active');
-
-    if(or.ok&&od.orient){
-      S.orientData=od.orient;
-      renderOrientCards(od.orient.orientations);
-
-      // Auto-load the best orientation's heatmap
-      const best=od.orient.orientations[0];
-      if(best.rotation_matrix){
-        await selectOrientation(0);
-      }else{
-        // Original is already best — just switch to heatmap
-        setTimeout(()=>switchView('heatmap'),300);
-      }
-    }else{
-      setTimeout(()=>switchView('heatmap'),300);
-    }
+    setTimeout(()=>switchView('heatmap'),300);
 
     const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
     btn.disabled=false;
     if(S.hasIssues){updateRepairButton();document.getElementById('freeLabel').textContent='Free heatmap, orient & analysis — sign up to repair'}
     else{btn.className='repair-btn download';bt.innerHTML='⬇ Download Clean File';document.getElementById('freeLabel').textContent=''}
+
+    // Run auto-orient in background (non-blocking) with timeout
+    const triCount = d.analysis.stats.triangles || 0;
+    if(triCount > 400000) {
+      document.getElementById('orientSection').style.display='block';
+      document.getElementById('orientSection').querySelector('.orient-loading').innerHTML='<div style="font-size:12px;color:var(--text-muted);padding:8px">⚡ Large model ('+triCount.toLocaleString()+' tris) — orientation skipped for speed. Use your slicer\'s auto-orient.</div>';
+      document.getElementById('orientStatus').textContent='Skipped';
+    } else {
+      document.getElementById('orientSection').style.display='block';
+      const orientTimeout = setTimeout(()=>{
+        document.getElementById('orientSection').querySelector('.orient-loading').innerHTML='<div style="font-size:12px;color:var(--text-muted);padding:8px">⏱ Orientation timed out. Model is still ready for repair & download.</div>';
+        document.getElementById('orientStatus').textContent='Timed out';
+      }, 90000);
+      fetch(`/api/orient/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})
+        .then(r=>r.json()).then(od=>{
+          clearTimeout(orientTimeout);
+          if(od.orient){S.orientData=od.orient;renderOrientCards(od.orient.orientations);document.getElementById('orientStatus').textContent='Done'}
+        }).catch(()=>{clearTimeout(orientTimeout);document.getElementById('orientStatus').textContent='Error'});
+    }
   }catch(e){ov.classList.remove('active');showToast('❌ '+e.message);console.error(e)}
 }
 
@@ -1020,27 +1021,33 @@ async function submitFailure() {
     const pd = await pr.json();
     if (pr.ok && pd.vertex_colors) { S.heatmapData = pd; S.heatmapMesh = buildHeatmapMesh(d.mesh_data, pd.vertex_colors); S.heatmapMesh.visible = false; S.scene.add(S.heatmapMesh); renderPrintability(pd.printability); }
 
-    // Orient
-    document.getElementById('overlayText').textContent = 'Finding best print orientation...';
-    document.getElementById('orientSection').style.display = 'block';
-    const or2 = await fetch(`/api/orient/${S.jobId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
-    const od = await or2.json();
+    // Dismiss overlay — core analysis is done
     ov.classList.remove('active');
-
-    if (or2.ok && od.orient) {
-      S.orientData = od.orient;
-      renderOrientCards(od.orient.orientations);
-      const best = od.orient.orientations[0];
-      if (best.rotation_matrix) { await selectOrientation(0); }
-      else { setTimeout(() => switchView('heatmap'), 300); }
-    } else {
-      setTimeout(() => switchView('heatmap'), 300);
-    }
+    setTimeout(() => switchView('heatmap'), 300);
 
     const btn = document.getElementById('repairBtn'), bt = document.getElementById('repairBtnText');
     btn.disabled = false;
     if (S.hasIssues) { updateRepairButton(); document.getElementById('freeLabel').textContent = 'Free heatmap, orient & analysis'; }
     else { btn.className = 'repair-btn download'; bt.innerHTML = '⬇ Download Clean File'; document.getElementById('freeLabel').textContent = ''; }
+
+    // Orient in background (non-blocking)
+    const triCount2 = d.analysis.stats.triangles || 0;
+    if(triCount2 > 400000) {
+      document.getElementById('orientSection').style.display='block';
+      document.getElementById('orientSection').querySelector('.orient-loading').innerHTML='<div style="font-size:12px;color:var(--text-muted);padding:8px">⚡ Large model ('+triCount2.toLocaleString()+' tris) — orientation skipped for speed.</div>';
+      document.getElementById('orientStatus').textContent='Skipped';
+    } else {
+      document.getElementById('orientSection').style.display='block';
+      const ot2 = setTimeout(()=>{
+        document.getElementById('orientSection').querySelector('.orient-loading').innerHTML='<div style="font-size:12px;color:var(--text-muted);padding:8px">⏱ Orientation timed out.</div>';
+        document.getElementById('orientStatus').textContent='Timed out';
+      }, 90000);
+      fetch(`/api/orient/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})})
+        .then(r=>r.json()).then(od=>{
+          clearTimeout(ot2);
+          if(od.orient){S.orientData=od.orient;renderOrientCards(od.orient.orientations);document.getElementById('orientStatus').textContent='Done'}
+        }).catch(()=>{clearTimeout(ot2);document.getElementById('orientStatus').textContent='Error'});
+    }
   } catch(e) { ov.classList.remove('active'); showToast('❌ ' + e.message); }
 })();
 
