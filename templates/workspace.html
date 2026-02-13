@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SliceReady — Fix AI-Generated 3D Models for Printing</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a0a0a;--surface:#141414;--surface-2:#1a1a1a;--border:#2a2a2a;--text:#e8e8e8;--text-muted:#888;--accent:#00ff88;--accent-dim:#00ff8822;--danger:#ff4444;--danger-dim:#ff444422;--warning:#ffaa00;--warning-dim:#ffaa0022}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;overflow-x:hidden}
+.header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--surface)}
+.logo{display:flex;align-items:center;gap:10px}
+.logo-icon{width:32px;height:32px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
+.logo-icon svg{width:20px;height:20px}
+.logo-text{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px;letter-spacing:-0.5px}
+.logo-text span{color:var(--accent)}
+.tagline{font-size:13px;color:var(--text-muted);font-family:'JetBrains Mono',monospace}
+.upload-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:calc(100vh - 65px);padding:40px}
+.upload-zone.hidden{display:none}
+.dropzone{width:100%;max-width:640px;border:2px dashed var(--border);border-radius:16px;padding:80px 40px;text-align:center;cursor:pointer;transition:all .3s;background:var(--surface);position:relative;overflow:hidden}
+.dropzone::before{content:'';position:absolute;inset:0;background:radial-gradient(circle at 50% 50%,var(--accent-dim),transparent 70%);opacity:0;transition:opacity .3s}
+.dropzone:hover,.dropzone.dragover{border-color:var(--accent);transform:translateY(-2px)}
+.dropzone:hover::before,.dropzone.dragover::before{opacity:1}
+.drop-icon{width:64px;height:64px;margin:0 auto 24px;border-radius:16px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;border:1px solid var(--border)}
+.drop-icon svg{width:32px;height:32px;stroke:var(--accent)}
+.drop-title{font-size:20px;font-weight:600;margin-bottom:8px}
+.drop-subtitle{color:var(--text-muted);font-size:14px;margin-bottom:24px;line-height:1.5}
+.drop-formats{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.format-tag{font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text-muted)}
+.file-input{display:none}
+.use-case-banner{max-width:640px;width:100%;margin-top:32px;padding:20px 24px;background:var(--surface);border:1px solid var(--border);border-radius:12px;display:flex;align-items:flex-start;gap:14px}
+.use-case-icon{flex-shrink:0;width:36px;height:36px;border-radius:8px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;font-size:18px}
+.use-case-text h4{font-size:14px;font-weight:600;margin-bottom:4px}
+.use-case-text p{font-size:13px;color:var(--text-muted);line-height:1.5}
+.workspace{display:none;height:calc(100vh - 65px)}
+.workspace.active{display:grid;grid-template-columns:1fr 380px}
+.viewer-panel{position:relative;background:var(--bg);overflow:hidden}
+.viewer-controls{position:absolute;top:16px;left:16px;display:flex;flex-direction:column;gap:8px;z-index:10}
+.control-row{display:flex;gap:4px}
+.view-btn{padding:7px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--surface);color:var(--text-muted);border:1px solid var(--border);cursor:pointer;transition:all .2s;border-radius:6px;white-space:nowrap}
+.view-btn.active{background:var(--accent);color:var(--bg);font-weight:600;border-color:var(--accent)}
+.view-btn:hover:not(.active){color:var(--text);border-color:var(--text-muted)}
+.view-btn.heatmap-btn.active{background:#ff6633;border-color:#ff6633}
+.reset-btn{position:absolute;top:16px;right:16px;z-index:10;padding:8px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer;transition:all .2s}
+.reset-btn:hover{color:var(--text);border-color:var(--text-muted)}
+.model-info-bar{position:absolute;bottom:16px;left:16px;display:flex;gap:12px;z-index:10;flex-wrap:wrap}
+.info-chip{font-family:'JetBrains Mono',monospace;font-size:11px;padding:6px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text-muted);backdrop-filter:blur(8px)}
+.info-chip b{color:var(--text);font-weight:600}
+.heatmap-legend{position:absolute;bottom:16px;right:16px;z-index:10;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;min-width:180px;display:none}
+.heatmap-legend.active{display:block}
+.legend-title{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin-bottom:10px}
+.legend-gradient{height:14px;border-radius:3px;background:linear-gradient(to right,#00dd44,#66dd00,#ddcc00,#ff8800,#ff3300);margin-bottom:8px}
+.legend-labels{display:flex;justify-content:space-between;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted);margin-bottom:12px}
+.legend-stats{display:flex;flex-direction:column;gap:6px}
+.legend-stat{display:flex;justify-content:space-between;align-items:center;font-size:12px}
+.legend-stat .label{color:var(--text-muted);font-size:11px}
+.legend-stat .value{font-family:'JetBrains Mono',monospace;font-weight:600;font-size:12px}
+.legend-stat .value.good{color:#00dd44}.legend-stat .value.warn{color:#ffaa00}.legend-stat .value.bad{color:#ff3300}
+.legend-difficulty{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);text-align:center}
+.difficulty-badge{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;padding:4px 12px;border-radius:4px;display:inline-block}
+.difficulty-badge.easy{background:#00dd4422;color:#00dd44}
+.difficulty-badge.moderate{background:#ffaa0022;color:#ffaa00}
+.difficulty-badge.difficult{background:#ff330022;color:#ff3300}
+.heatmap-filters{display:none;margin-top:4px}
+.heatmap-filters.active{display:flex;gap:4px;flex-wrap:wrap}
+.filter-btn{padding:5px 10px;font-family:'JetBrains Mono',monospace;font-size:10px;background:var(--surface);color:var(--text-muted);border:1px solid var(--border);border-radius:5px;cursor:pointer;transition:all .2s}
+.filter-btn.active{background:var(--surface-2);color:var(--text);border-color:var(--text-muted)}
+.filter-btn:hover{color:var(--text)}
+.select-bar{display:none;position:absolute;bottom:50px;left:50%;transform:translateX(-50%);z-index:10;background:var(--surface);border:1px solid var(--accent);border-radius:10px;padding:10px 16px;align-items:center;gap:12px;font-size:12px;box-shadow:0 4px 20px rgba(0,255,136,.15)}
+.select-bar.active{display:flex}
+.sel-count{font-family:'JetBrains Mono',monospace;color:var(--accent);font-weight:600}
+.sel-btn{padding:6px 12px;font-family:'JetBrains Mono',monospace;font-size:10px;border-radius:5px;border:1px solid var(--border);cursor:pointer;background:var(--surface-2);color:var(--text);transition:all .2s}
+.sel-btn.fix{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.sel-btn.clear{background:transparent;color:var(--text-muted)}
+.fmt-row{display:flex;gap:0;margin-top:8px}
+.fmt-btn{flex:1;padding:8px;font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--surface-2);color:var(--text-muted);border:1px solid var(--border);cursor:pointer;transition:all .2s;text-align:center}
+.fmt-btn:first-child{border-radius:6px 0 0 6px}.fmt-btn:last-child{border-radius:0 6px 6px 0}
+.fmt-btn.active{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+.auth-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:200;align-items:center;justify-content:center}
+.auth-overlay.active{display:flex}
+.auth-modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:100%;max-width:400px;padding:32px;position:relative}
+.auth-close{position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer}
+.auth-title{font-size:22px;font-weight:700;margin-bottom:4px}
+.auth-sub{font-size:13px;color:var(--text-muted);margin-bottom:24px}
+.auth-tabs{display:flex;gap:0;margin-bottom:20px}
+.auth-tab{flex:1;padding:10px;text-align:center;font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--surface-2);border:1px solid var(--border);cursor:pointer;color:var(--text-muted);transition:all .2s}
+.auth-tab:first-child{border-radius:8px 0 0 8px}.auth-tab:last-child{border-radius:0 8px 8px 0}
+.auth-tab.active{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+.auth-field{margin-bottom:12px}
+.auth-field label{display:block;font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}
+.auth-field input{width:100%;padding:10px 14px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none}
+.auth-field input:focus{border-color:var(--accent)}
+.auth-submit{width:100%;padding:12px;background:var(--accent);color:var(--bg);border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px}
+.auth-error{color:var(--danger);font-size:12px;margin-top:8px;display:none}
+.upgrade-box{background:linear-gradient(135deg,var(--surface-2),var(--surface));border:1px solid var(--accent);border-radius:12px;padding:20px;text-align:center}
+.upgrade-box h3{font-size:16px;margin-bottom:4px}.upgrade-box p{font-size:12px;color:var(--text-muted);margin-bottom:12px}
+.upgrade-box .price{font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:700;color:var(--accent)}
+.upgrade-box .period{font-size:12px;color:var(--text-muted)}
+.user-bar{display:flex;align-items:center;gap:10px}
+.user-pill{font-family:'JetBrains Mono',monospace;font-size:11px;padding:4px 10px;border-radius:5px}
+.user-pill.maker{background:var(--accent-dim);color:var(--accent)}
+.user-pill.pro{background:#4488ff22;color:#4488ff}
+.usage-pill{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted)}
+.login-btn{padding:6px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--accent);color:var(--bg);border:none;border-radius:6px;cursor:pointer;font-weight:600}
+.side-panel{background:var(--surface);border-left:1px solid var(--border);overflow-y:auto;display:flex;flex-direction:column}
+.panel-section{padding:20px;border-bottom:1px solid var(--border)}
+.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.section-title{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted)}
+.status-badge{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;padding:3px 8px;border-radius:4px}
+.status-badge.issues{background:var(--danger-dim);color:var(--danger)}
+.status-badge.clean{background:var(--accent-dim);color:var(--accent)}
+.status-badge.warning{background:var(--warning-dim);color:var(--warning)}
+.status-badge.scanning{background:#ffffff11;color:var(--text-muted)}
+.issue-list{display:flex;flex-direction:column;gap:8px}
+.issue-card{display:flex;align-items:flex-start;gap:12px;padding:12px;background:var(--surface-2);border-radius:8px;border:1px solid var(--border)}
+.issue-icon{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px}
+.issue-icon.error{background:var(--danger-dim);color:var(--danger)}.issue-icon.warn{background:var(--warning-dim);color:var(--warning)}.issue-icon.ok{background:var(--accent-dim);color:var(--accent)}
+.issue-info h4{font-size:13px;font-weight:600;margin-bottom:2px}
+.issue-info p{font-size:12px;color:var(--text-muted);line-height:1.4}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stat-card{padding:12px;background:var(--surface-2);border-radius:8px;border:1px solid var(--border)}
+.stat-label{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px}
+.stat-value{font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700}
+.stat-value.good{color:var(--accent)}.stat-value.bad{color:var(--danger)}.stat-value.neutral{color:var(--text)}
+.print-bar{display:flex;height:8px;border-radius:4px;overflow:hidden;gap:2px;margin-top:8px}
+.print-bar .seg{transition:width .5s ease}.print-bar .seg.good{background:#00dd44}.print-bar .seg.warn{background:#ffaa00}.print-bar .seg.bad{background:#ff3300}
+.print-bar-labels{display:flex;justify-content:space-between;margin-top:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted)}
+/* ── Orient Cards ── */
+.orient-cards{display:flex;flex-direction:column;gap:8px}
+.orient-card{padding:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;cursor:pointer;transition:all .2s;position:relative}
+.orient-card:hover{border-color:var(--text-muted);transform:translateY(-1px)}
+.orient-card.selected{border-color:var(--accent);background:var(--accent-dim)}
+.orient-card.loading{opacity:0.6;pointer-events:none}
+.orient-rank{position:absolute;top:10px;right:10px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted);background:var(--surface);padding:2px 6px;border-radius:3px}
+.orient-label{font-size:13px;font-weight:600;margin-bottom:2px;padding-right:40px}
+.orient-desc{font-size:11px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;margin-bottom:8px}
+.orient-tags{display:flex;gap:4px;flex-wrap:wrap}
+.orient-tag{font-family:'JetBrains Mono',monospace;font-size:9px;padding:2px 7px;border-radius:3px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.orient-tag.recommended{background:#00ff8833;color:#00ff88}
+.orient-tag.fastest{background:#4488ff33;color:#4488ff}
+.orient-tag.least_supports{background:#ffaa0033;color:#ffaa00}
+.orient-tag.best_surface{background:#cc66ff33;color:#cc66ff}
+.orient-loading{text-align:center;padding:20px;color:var(--text-muted);font-size:12px}
+.orient-loading .spinner{margin:0 auto 8px}
+/* ── Repair Section ── */
+.repair-section{padding:20px;margin-top:auto;border-top:1px solid var(--border)}
+.progress-container{display:none;margin-bottom:16px}.progress-container.active{display:block}
+.progress-bar-bg{height:4px;background:var(--surface-2);border-radius:2px;overflow:hidden;margin-bottom:8px}
+.progress-bar-fill{height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width .5s ease}
+.progress-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)}
+.repair-summary{display:none}.repair-summary.active{display:block;padding:16px;background:var(--accent-dim);border:1px solid rgba(0,255,136,.2);border-radius:10px;margin-bottom:12px}
+.repair-summary h4{font-size:14px;font-weight:700;color:var(--accent);margin-bottom:8px}
+.repair-summary ul{list-style:none;display:flex;flex-direction:column;gap:4px}
+.repair-summary li{font-size:11px;color:var(--text);font-family:'JetBrains Mono',monospace;line-height:1.4;padding-left:16px;position:relative}
+.repair-summary li::before{content:'✓';color:var(--accent);font-weight:700;position:absolute;left:0}
+.failure-report-btn{margin-top:10px;padding:6px 12px;border-radius:6px;background:transparent;border:1px solid var(--border);color:var(--text-muted);font-size:11px;cursor:pointer;font-family:'JetBrains Mono',monospace;transition:all .2s}
+.failure-report-btn:hover{border-color:var(--red);color:var(--red)}
+.failure-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center}
+.failure-modal.active{display:flex}
+.failure-modal-inner{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:360px;width:90%}
+.failure-modal-inner h4{font-size:14px;color:var(--text);margin-bottom:4px}
+.failure-options{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.fo{padding:8px;border-radius:6px;background:var(--bg-dark);border:1px solid var(--border);color:var(--text-muted);font-size:11px;cursor:pointer;transition:all .2s;text-align:left}
+.fo:hover{border-color:var(--text-muted)}
+.fo.selected{border-color:var(--red);color:var(--red);background:rgba(255,68,85,.08)}
+.repair-btn{width:100%;padding:14px;border:none;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:700;cursor:pointer;transition:all .3s;display:flex;align-items:center;justify-content:center;gap:8px}
+.repair-btn.analyze{background:var(--accent);color:var(--bg)}.repair-btn.analyze:hover{transform:translateY(-1px);box-shadow:0 4px 20px var(--accent-dim)}
+.repair-btn.download{background:linear-gradient(135deg,#00c96a,#00ff88);color:var(--bg)}.repair-btn.download:hover{transform:translateY(-1px);box-shadow:0 4px 24px rgba(0,255,136,.3)}
+.repair-btn:disabled{opacity:.4;cursor:not-allowed;transform:none!important;box-shadow:none!important}
+.price-tag{font-family:'JetBrains Mono',monospace;font-size:13px;background:rgba(0,0,0,.2);padding:2px 8px;border-radius:4px}
+.free-label{display:block;text-align:center;margin-top:8px;font-size:12px;color:var(--text-muted)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:18px;height:18px;border:2px solid transparent;border-top-color:currentColor;border-radius:50%;animation:spin .6s linear infinite;display:inline-block}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--surface);border:1px solid var(--border);padding:12px 20px;border-radius:10px;font-size:13px;z-index:1000;transition:transform .3s ease;display:flex;align-items:center;gap:8px}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.upload-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100;flex-direction:column;align-items:center;justify-content:center}
+.upload-overlay.active{display:flex}
+.upload-overlay .spinner{width:40px;height:40px;border-width:3px;border-top-color:var(--accent)}
+.upload-overlay p{margin-top:20px;font-size:16px}.upload-overlay .sub{font-size:13px;color:var(--text-muted);margin-top:6px}
+@media(max-width:800px){.workspace.active{grid-template-columns:1fr;grid-template-rows:50vh auto}.tagline{display:none}.heatmap-legend{bottom:50px;right:8px;min-width:160px}}
+.side-panel::-webkit-scrollbar{width:6px}.side-panel::-webkit-scrollbar-track{background:transparent}.side-panel::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+/* ── Auth ── */
+.auth-bar{display:flex;align-items:center;gap:10px}
+.auth-btn{padding:6px 14px;font-family:'JetBrains Mono',monospace;font-size:12px;border-radius:6px;cursor:pointer;border:1px solid var(--border);background:var(--surface-2);color:var(--text);transition:all .2s}
+.auth-btn:hover{border-color:var(--text-muted)}
+.auth-btn.primary{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+.auth-btn.primary:hover{box-shadow:0 2px 10px var(--accent-dim)}
+.user-pill{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:8px}
+.tier-badge{font-size:9px;font-weight:700;padding:2px 8px;border-radius:3px;text-transform:uppercase;letter-spacing:.5px}
+.tier-badge.free{background:var(--surface-2);color:var(--text-muted);border:1px solid var(--border)}
+.tier-badge.maker{background:var(--accent-dim);color:var(--accent)}
+.tier-badge.pro{background:#cc66ff22;color:#cc66ff}
+.usage-pill{font-size:10px;color:var(--text-muted);padding:2px 6px;background:var(--surface-2);border-radius:3px}
+/* Modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:200;align-items:center;justify-content:center}
+.modal-overlay.active{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px;width:90%;max-width:420px;position:relative}
+.modal h2{font-size:20px;margin-bottom:6px}
+.modal .sub{color:var(--text-muted);font-size:13px;margin-bottom:24px}
+.modal-close{position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
+.form-input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:'DM Sans',sans-serif;font-size:14px;outline:none;transition:border .2s}
+.form-input:focus{border-color:var(--accent)}
+.form-submit{width:100%;padding:12px;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:700;cursor:pointer;background:var(--accent);color:var(--bg);transition:all .2s;margin-top:8px}
+.form-submit:hover{box-shadow:0 4px 16px var(--accent-dim)}
+.form-submit:disabled{opacity:.4;cursor:not-allowed}
+.form-switch{text-align:center;margin-top:16px;font-size:13px;color:var(--text-muted)}
+.form-switch a{color:var(--accent);cursor:pointer;text-decoration:none}
+.form-error{color:var(--danger);font-size:12px;margin-top:8px;font-family:'JetBrains Mono',monospace}
+/* Pricing card */
+.pricing-card{background:var(--bg);border:1px solid var(--accent);border-radius:12px;padding:20px;margin-top:16px}
+.pricing-card h3{font-size:16px;margin-bottom:4px}
+.pricing-card .price{font-family:'JetBrains Mono',monospace;font-size:28px;font-weight:700;color:var(--accent)}
+.pricing-card .price span{font-size:14px;color:var(--text-muted);font-weight:400}
+.pricing-card ul{list-style:none;margin:12px 0;font-size:13px;color:var(--text-muted)}
+.pricing-card li{padding:4px 0;padding-left:20px;position:relative}
+.pricing-card li::before{content:'✓';position:absolute;left:0;color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="header"><div class="logo"><a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none"><div class="logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#0a0a0a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><div class="logo-text">Slice<span>Ready</span></div></a></div><div style="display:flex;gap:16px;align-items:center"><a href="/app" style="color:var(--accent);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px;background:var(--accent-dim)">Single File</a><a href="/batch" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">Batch</a><a href="/api/v1/docs" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">API</a><div class="auth-bar" id="authBar"><button class="auth-btn primary" onclick="showAuth('signup')">Sign up free</button><button class="auth-btn" onclick="showAuth('login')">Log in</button></div></div></div>
+
+<!-- Auth Modal -->
+<div class="modal-overlay" id="authModal">
+  <div class="modal">
+    <button class="modal-close" onclick="hideAuth()">&times;</button>
+    <div id="authSignup">
+      <h2>Create your account</h2>
+      <p class="sub">Free heatmap and analysis. Subscribe to repair and download.</p>
+      <div class="form-group"><label>Email</label><input class="form-input" type="email" id="signupEmail" placeholder="you@email.com"></div>
+      <div class="form-group"><label>Password</label><input class="form-input" type="password" id="signupPassword" placeholder="6+ characters"></div>
+      <button class="form-submit" id="signupBtn" onclick="doSignup()">Create account</button>
+      <div class="form-error" id="signupError"></div>
+      <div class="form-switch">Already have an account? <a onclick="showAuth('login')">Log in</a></div>
+    </div>
+    <div id="authLogin" style="display:none">
+      <h2>Welcome back</h2>
+      <p class="sub">Log in to repair and download your files.</p>
+      <div class="form-group"><label>Email</label><input class="form-input" type="email" id="loginEmail" placeholder="you@email.com"></div>
+      <div class="form-group"><label>Password</label><input class="form-input" type="password" id="loginPassword" placeholder="Password"></div>
+      <button class="form-submit" id="loginSubmitBtn" onclick="doLogin()">Log in</button>
+      <div class="form-error" id="loginError"></div>
+      <div class="form-switch">Need an account? <a onclick="showAuth('signup')">Sign up free</a></div>
+    </div>
+    <div id="authUpgrade" style="display:none">
+      <h2>Upgrade to Maker</h2>
+      <p class="sub">Unlock repairs and downloads.</p>
+      <div class="pricing-card">
+        <h3>Maker Plan</h3>
+        <div class="price">$9<span>/month</span></div>
+        <ul>
+          <li>30 repairs/month & downloads</li>
+          <li>Non-destructive targeted repair</li>
+          <li>Export as STL or 3MF</li>
+          <li>Auto-orient with heatmap comparison</li>
+          <li>Cancel anytime</li>
+        </ul>
+        <button class="form-submit" onclick="doSubscribe()">Start Maker Plan</button>
+      </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="upload-zone" id="uploadZone">
+  <div class="dropzone" id="dropzone">
+    <div class="drop-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>
+    <div class="drop-title">Drop your 3D model here</div>
+    <div class="drop-subtitle">Upload an STL from Meshy, Tripo, CSM, or any AI 3D tool.<br>See exactly where it'll fail before you print.</div>
+    <div class="drop-formats"><span class="format-tag">.STL</span><span class="format-tag">Binary & ASCII</span><span class="format-tag">Up to 100MB</span></div>
+    <input type="file" class="file-input" id="fileInput" accept=".stl">
+  </div>
+  <div class="use-case-banner"><div class="use-case-icon">🔥</div><div class="use-case-text"><h4>Heatmap + Auto-Orient</h4><p>See overhangs, thin walls, and bridges highlighted on your model. Then let SliceReady find the best print orientation automatically — comparing 10 positions so you don't have to.</p></div></div>
+</div>
+
+<div class="workspace" id="workspace">
+  <div class="viewer-panel" id="viewerPanel">
+    <div class="viewer-controls">
+      <div class="control-row" id="meshToggle">
+        <button class="view-btn active" data-view="original">Original</button>
+        <button class="view-btn" data-view="repaired" style="display:none" id="repairedBtn">Repaired</button>
+        <button class="view-btn heatmap-btn" data-view="heatmap" id="heatmapToggle">🔥 Heatmap</button>
+      </div>
+      <div class="heatmap-filters" id="heatmapFilters">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="overhangs">Overhangs</button>
+        <button class="filter-btn" data-filter="thin_walls">Thin walls</button>
+        <button class="filter-btn" data-filter="bridges">Bridges</button>
+      </div>
+    </div>
+    <button class="reset-btn" id="resetBtn">← New file</button>
+    <div class="model-info-bar" id="modelInfoBar"></div>
+    <div class="heatmap-legend" id="heatmapLegend">
+      <div class="legend-title">Printability</div>
+      <div class="legend-gradient"></div>
+      <div class="legend-labels"><span>Safe</span><span>Risk</span><span>Fail</span></div>
+      <div class="legend-stats" id="legendStats"></div>
+      <div class="legend-difficulty"><div class="difficulty-badge" id="difficultyBadge">—</div></div>
+    </div>
+    <div id="threeContainer" style="width:100%;height:100%"></div>
+    <div class="select-bar" id="selectBar">
+      <span class="sel-count" id="selCount">0 faces</span>
+      <button class="sel-btn fix" id="selFixBtn">🔧 Fix Region</button>
+      <button class="sel-btn" id="selSmoothBtn">✨ Smooth</button>
+      <button class="sel-btn clear" id="selClearBtn">✕ Clear</button>
+    </div>
+  </div>
+
+  <div class="side-panel" id="sidePanel">
+    <div class="panel-section"><div class="section-header"><span class="section-title">File</span></div><div id="fileName" style="font-size:14px;font-weight:600;margin-bottom:4px;word-break:break-all"></div><div id="fileSize" style="font-size:12px;color:var(--text-muted);font-family:'JetBrains Mono',monospace"></div></div>
+
+    <div class="panel-section" id="orientSection" style="display:none">
+      <div class="section-header"><span class="section-title">🔄 Best Orientation</span><span class="status-badge" id="orientStatus">Analyzing</span></div>
+      <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Click to preview each orientation with live heatmap.</p>
+      <div class="orient-cards" id="orientCards">
+        <div class="orient-loading"><div class="spinner"></div><div>Testing 10 orientations...</div></div>
+      </div>
+    </div>
+
+    <div class="panel-section" id="printabilitySection" style="display:none">
+      <div class="section-header"><span class="section-title">Printability Score</span><span class="status-badge" id="printStatus">—</span></div>
+      <div class="print-bar" id="printBar"><div class="seg good" style="width:0%"></div><div class="seg warn" style="width:0%"></div><div class="seg bad" style="width:0%"></div></div>
+      <div class="print-bar-labels"><span id="printGoodPct">—</span><span id="printWarnPct">—</span><span id="printBadPct">—</span></div>
+      <div class="stats-grid" style="margin-top:12px" id="printStatsGrid"></div>
+    </div>
+
+    <div class="panel-section"><div class="section-header"><span class="section-title">Mesh Analysis</span><span class="status-badge scanning" id="overallStatus">Uploading...</span></div><div class="stats-grid" id="statsGrid"></div></div>
+    <div class="panel-section"><div class="section-header"><span class="section-title">Issues</span><span id="issueCount" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-muted)"></span></div><div class="issue-list" id="issueList"><div class="issue-card"><div class="issue-icon warn">⏳</div><div class="issue-info"><h4>Analyzing...</h4><p>Running mesh analysis.</p></div></div></div></div>
+
+    <div class="repair-section">
+      <div class="progress-container" id="progressContainer"><div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div><div class="progress-label" id="progressLabel"></div></div>
+      <div class="repair-summary" id="repairSummary"><h4>✨ Repairs Complete</h4><ul id="repairList"></ul><button class="failure-report-btn" id="reportFailureBtn" onclick="showFailureModal()" style="display:none">🖨 Didn't print right?</button></div>
+      <div class="failure-modal" id="failureModal">
+        <div class="failure-modal-inner">
+          <h4>Report a print failure</h4>
+          <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">This helps us improve repairs. What happened?</p>
+          <div class="failure-options">
+            <button class="fo" data-cat="spaghetti" onclick="selectFailureCat(this)">🍝 Spaghetti</button>
+            <button class="fo" data-cat="supports_failed" onclick="selectFailureCat(this)">🏗 Supports failed</button>
+            <button class="fo" data-cat="surface_artifacts" onclick="selectFailureCat(this)">🔍 Surface issues</button>
+            <button class="fo" data-cat="incomplete" onclick="selectFailureCat(this)">⏸ Print incomplete</button>
+            <button class="fo" data-cat="layer_shift" onclick="selectFailureCat(this)">📐 Layer shift</button>
+            <button class="fo" data-cat="other" onclick="selectFailureCat(this)">❓ Other</button>
+          </div>
+          <input type="text" id="failurePrinter" placeholder="Printer (e.g. Bambu P1S)" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text);font-size:12px;margin-top:8px;font-family:'JetBrains Mono',monospace">
+          <textarea id="failureNotes" placeholder="Any details? (optional)" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-dark);color:var(--text);font-size:12px;margin-top:6px;font-family:'JetBrains Mono',monospace;resize:vertical;height:50px"></textarea>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button onclick="submitFailure()" style="flex:1;padding:8px;border-radius:6px;background:var(--accent);color:#0a0a0a;font-weight:700;font-size:12px;border:none;cursor:pointer">Submit report</button>
+            <button onclick="closeFailureModal()" style="padding:8px 12px;border-radius:6px;background:var(--surface);color:var(--text-muted);font-size:12px;border:1px solid var(--border);cursor:pointer">Cancel</button>
+          </div>
+        </div>
+      </div>
+      <button class="repair-btn analyze" id="repairBtn" disabled><span id="repairBtnText">Waiting for analysis...</span></button>
+      <div class="fmt-row" id="fmtRow" style="display:none">
+        <button class="fmt-btn active" data-fmt="stl">STL</button>
+        <button class="fmt-btn" data-fmt="3mf">3MF</button>
+      </div>
+      <span class="free-label" id="freeLabel"></span>
+    </div>
+  </div>
+</div>
+<div class="upload-overlay" id="uploadOverlay"><div class="spinner"></div><p id="overlayText">Uploading & analyzing...</p><div class="sub">Running heatmap + auto-orient</div></div>
+<div class="toast" id="toast"></div>
+
+<!-- Auth Modal -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-modal">
+    <button class="auth-close" onclick="hideAuth()">✕</button>
+    <div id="authContent">
+      <div class="auth-title" id="authTitle">Get started</div>
+      <div class="auth-sub" id="authSub">Create a free account to unlock repairs</div>
+      <div class="auth-tabs">
+        <div class="auth-tab active" onclick="switchAuthTab('signup')">Sign Up</div>
+        <div class="auth-tab" onclick="switchAuthTab('login')">Log In</div>
+      </div>
+      <div class="auth-field"><label>Email</label><input type="email" id="authEmail" placeholder="you@example.com"></div>
+      <div class="auth-field"><label>Password</label><input type="password" id="authPassword" placeholder="6+ characters"></div>
+      <button class="auth-submit" id="authSubmit" onclick="doAuth()">Create Account</button>
+      <div class="auth-error" id="authError"></div>
+    </div>
+    <div id="upgradeContent" style="display:none">
+      <div class="upgrade-box">
+        <h3>Unlock Repairs</h3>
+        <p>Heatmap and analysis are free forever. Subscribe to repair and download.</p>
+        <div class="price">$9<span class="period">/month</span></div>
+      </div>
+      <div style="font-size:12px;color:var(--text-muted);margin:16px 0;line-height:1.8">
+        ✓ 30 repairs/month<br>
+        ✓ Download STL + 3MF<br>
+        ✓ Click-to-fix targeted repair<br>
+        ✓ Auto-orient optimization<br>
+        ✓ Cancel anytime
+      </div>
+      <button class="auth-submit" onclick="doSubscribe()">Start Maker Plan — $9/mo</button>
+      
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══ AUTH STATE ═══
+let authUser=null; // {email, tier, usage:{used,limit}}
+
+function showAuth(mode='signup'){
+  document.getElementById('authModal').classList.add('active');
+  document.getElementById('authSignup').style.display=mode==='signup'?'block':'none';
+  document.getElementById('authLogin').style.display=mode==='login'?'block':'none';
+  document.getElementById('authUpgrade').style.display=mode==='upgrade'?'block':'none';
+  document.getElementById('signupError').textContent='';
+  document.getElementById('loginError').textContent='';
+}
+function hideAuth(){document.getElementById('authModal').classList.remove('active')}
+
+function updateAuthUI(){
+  const bar=document.getElementById('authBar');
+  if(!authUser){
+    bar.innerHTML='<button class="auth-btn primary" onclick="showAuth(\'signup\')">Sign up free</button><button class="auth-btn" onclick="showAuth(\'login\')">Log in</button>';
+    return;
+  }
+  const t=authUser.tier||'free';
+  const u=authUser.usage||{used:0,limit:0};
+  let usageText=t==='free'?'':( ` <span class="usage-pill">${u.used}/${u.limit} repairs</span>`);
+  bar.innerHTML=`<span class="user-pill">${authUser.email} <span class="tier-badge ${t}">${t}</span>${usageText}</span>${t==='free'?'<button class="auth-btn primary" onclick="showAuth(\'upgrade\')" style="font-size:11px">Upgrade $9/mo</button>':''}<button class="auth-btn" onclick="doLogout()" style="font-size:10px">Log out</button>`;
+}
+
+function updateRepairButton(){
+  const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
+  if(!S.hasIssues&&!S.repaired){btn.className='repair-btn download';return}
+  if(S.repaired){
+    btn.disabled=false;btn.className='repair-btn download';
+    bt.innerHTML='Download Print-Ready File';
+    document.getElementById('fmtRow').style.display='flex';
+    return;
+  }
+  if(!authUser){
+    btn.disabled=false;btn.className='repair-btn analyze';
+    bt.innerHTML='🔒 Sign up to Repair & Download';
+    return;
+  }
+  if(authUser.tier==='free'){
+    btn.disabled=false;btn.className='repair-btn analyze';
+    bt.innerHTML='🔒 Upgrade to Maker to Repair';
+    return;
+  }
+  const u=authUser.usage||{used:0,limit:0};
+  if(u.used>=u.limit){
+    btn.disabled=true;btn.className='repair-btn analyze';
+    bt.innerHTML=`Limit reached — contact us`;
+    return;
+  }
+  btn.disabled=false;btn.className='repair-btn analyze';
+  bt.innerHTML='🔧 Repair & Make Print-Ready';
+}
+
+async function doSignup(){
+  const email=document.getElementById('signupEmail').value;
+  const pw=document.getElementById('signupPassword').value;
+  const errEl=document.getElementById('signupError');
+  try{
+    const r=await fetch('/api/auth/signup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
+    const d=await r.json();
+    if(!r.ok){errEl.textContent=d.error;return}
+    authUser=d;hideAuth();updateAuthUI();updateRepairButton();showToast('✅ Account created! Upgrade to start repairing.');
+    showAuth('upgrade');
+  }catch(e){errEl.textContent=e.message}
+}
+
+async function doLogin(){
+  const email=document.getElementById('loginEmail').value;
+  const pw=document.getElementById('loginPassword').value;
+  const errEl=document.getElementById('loginError');
+  try{
+    const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
+    const d=await r.json();
+    if(!r.ok){errEl.textContent=d.error;return}
+    authUser=d;hideAuth();updateAuthUI();updateRepairButton();showToast(`✅ Welcome back!`);
+  }catch(e){errEl.textContent=e.message}
+}
+
+async function doLogout(){
+  await fetch('/api/auth/logout',{method:'POST'});
+  authUser=null;updateAuthUI();updateRepairButton();showToast('Logged out');
+}
+
+async function doSubscribe(){
+  try{
+    const r=await fetch('/api/subscribe/maker',{method:'POST'});
+    const d=await r.json();
+    if(!r.ok){showToast('❌ '+d.error);return}
+    if(d.checkout_url){window.location.href=d.checkout_url;return}
+    // Demo mode
+    authUser.tier='maker';authUser.usage=d.usage;
+    hideAuth();updateAuthUI();updateRepairButton();showToast('🎉 Maker plan activated!');
+  }catch(e){showToast('❌ '+e.message)}
+}
+
+// Check auth on load
+(async()=>{
+  try{
+    const r=await fetch('/api/auth/me');const d=await r.json();
+    if(d.logged_in){authUser={email:d.email,tier:d.tier,usage:d.usage};updateAuthUI()}
+  }catch(e){}
+})();
+
+const S={jobId:null,scene:null,camera:null,renderer:null,originalMesh:null,repairedMesh:null,heatmapMesh:null,viewMode:'original',repaired:false,hasIssues:false,heatmapData:null,meshData:null,currentFilter:'all',orientData:null,selectedOrient:null,selectedFaces:[],downloadFormat:'stl',raycaster:new THREE.Raycaster()};
+
+function initThree(){const c=document.getElementById('threeContainer');const w=c.clientWidth,h=c.clientHeight;S.scene=new THREE.Scene();S.scene.background=new THREE.Color(0x0a0a0a);S.camera=new THREE.PerspectiveCamera(45,w/h,0.01,1000);S.camera.position.set(0,0,5);S.renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true});S.renderer.setSize(w,h);S.renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));c.appendChild(S.renderer.domElement);S.scene.add(new THREE.AmbientLight(0xffffff,0.6));const d1=new THREE.DirectionalLight(0xffffff,0.7);d1.position.set(5,10,7);S.scene.add(d1);const d2=new THREE.DirectionalLight(0xffffff,0.3);d2.position.set(-5,-3,-5);S.scene.add(d2);const grid=new THREE.GridHelper(20,40,0x1a1a1a,0x1a1a1a);grid.position.y=-2;S.scene.add(grid);let down=false,px=0,py=0,rX=-0.3,rY=0.6,dist=5;const el=S.renderer.domElement;el.addEventListener('mousedown',e=>{down=true;px=e.clientX;py=e.clientY});window.addEventListener('mouseup',()=>down=false);window.addEventListener('mousemove',e=>{if(!down)return;rY+=(e.clientX-px)*0.005;rX+=(e.clientY-py)*0.005;rX=Math.max(-Math.PI/2,Math.min(Math.PI/2,rX));px=e.clientX;py=e.clientY});el.addEventListener('wheel',e=>{dist+=e.deltaY*0.005;dist=Math.max(0.5,Math.min(50,dist));e.preventDefault()},{passive:false});el.addEventListener('touchstart',e=>{if(e.touches.length===1){down=true;px=e.touches[0].clientX;py=e.touches[0].clientY}});el.addEventListener('touchend',()=>down=false);el.addEventListener('touchmove',e=>{if(!down||e.touches.length!==1)return;rY+=(e.touches[0].clientX-px)*0.005;rX+=(e.touches[0].clientY-py)*0.005;rX=Math.max(-Math.PI/2,Math.min(Math.PI/2,rX));px=e.touches[0].clientX;py=e.touches[0].clientY});(function a(){requestAnimationFrame(a);S.camera.position.set(dist*Math.sin(rY)*Math.cos(rX),dist*Math.sin(rX),dist*Math.cos(rY)*Math.cos(rX));S.camera.lookAt(0,0,0);S.renderer.render(S.scene,S.camera)})();window.addEventListener('resize',()=>{const w2=c.clientWidth,h2=c.clientHeight;S.camera.aspect=w2/h2;S.camera.updateProjectionMatrix();S.renderer.setSize(w2,h2)})}
+
+function centerAndScale(geo,mesh){geo.computeBoundingBox();const c=new THREE.Vector3();geo.boundingBox.getCenter(c);geo.translate(-c.x,-c.y,-c.z);const s=new THREE.Vector3();geo.boundingBox.getSize(s);const m=Math.max(s.x,s.y,s.z);if(m>0){const sc=3/m;mesh.scale.set(sc,sc,sc)}}
+
+function buildMesh(md,color,flat){const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(md.vertices),3));if(md.indices&&md.indices.length)geo.setIndex(md.indices);geo.computeVertexNormals();const mat=new THREE.MeshPhongMaterial({color,specular:0x222222,shininess:40,flatShading:flat,side:THREE.DoubleSide});const m=new THREE.Mesh(geo,mat);centerAndScale(geo,m);return m}
+
+function buildHeatmapMesh(md,vertexColors){const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(md.vertices),3));if(md.indices&&md.indices.length)geo.setIndex(md.indices);geo.computeVertexNormals();geo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(vertexColors),3));const mat=new THREE.MeshPhongMaterial({vertexColors:true,specular:0x111111,shininess:20,flatShading:true,side:THREE.DoubleSide});const m=new THREE.Mesh(geo,mat);centerAndScale(geo,m);return m}
+
+function scoreToColor(s){if(s<0.3){const t=s/0.3;return[t*0.9,0.85+t*0.15,0.1*(1-t)]}if(s<0.6){const t=(s-0.3)/0.3;return[0.9+t*0.1,1-t*0.4,0]}const t=(s-0.6)/0.4;return[1,0.6*(1-t),0]}
+
+function applyHeatmapFilter(filter){if(!S.heatmapData||!S.heatmapMesh)return;S.currentFilter=filter;const n=S.heatmapData.composite_scores.length;const masks=S.heatmapData.category_masks;const vc=new Float32Array(n*9);for(let i=0;i<n;i++){let active=filter==='all'||(filter==='overhangs'&&masks.overhangs[i])||(filter==='thin_walls'&&masks.thin_walls[i])||(filter==='bridges'&&masks.bridges[i]);let c=active?scoreToColor(S.heatmapData.composite_scores[i]):[0.22,0.22,0.22];for(let v=0;v<3;v++){vc[i*9+v*3]=c[0];vc[i*9+v*3+1]=c[1];vc[i*9+v*3+2]=c[2]}}S.heatmapMesh.geometry.setAttribute('color',new THREE.BufferAttribute(vc,3));S.heatmapMesh.geometry.attributes.color.needsUpdate=true;document.querySelectorAll('.filter-btn').forEach(b=>b.classList.toggle('active',b.dataset.filter===filter))}
+
+function showToast(m){const t=document.getElementById('toast');t.innerHTML=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3500)}
+function showProgress(l,p){document.getElementById('progressContainer').classList.add('active');document.getElementById('progressFill').style.width=p+'%';document.getElementById('progressLabel').textContent=l}
+function hideProgress(){document.getElementById('progressContainer').classList.remove('active')}
+
+function renderStats(s){const d=s.dimensions;document.getElementById('statsGrid').innerHTML=`<div class="stat-card"><div class="stat-label">Triangles</div><div class="stat-value ${s.is_high_poly?'bad':'neutral'}">${s.triangles.toLocaleString()}</div></div><div class="stat-card"><div class="stat-label">Vertices</div><div class="stat-value neutral">${s.vertices.toLocaleString()}</div></div><div class="stat-card"><div class="stat-label">Dimensions</div><div class="stat-value neutral" style="font-size:11px">${d.x.toFixed(1)} × ${d.y.toFixed(1)} × ${d.z.toFixed(1)}</div></div><div class="stat-card"><div class="stat-label">Watertight</div><div class="stat-value ${s.is_watertight?'good':'bad'}">${s.is_watertight?'Yes':'No'}</div></div>`;document.getElementById('modelInfoBar').innerHTML=`<div class="info-chip"><b>${s.triangles.toLocaleString()}</b> tris</div><div class="info-chip"><b>${d.x.toFixed(1)}×${d.y.toFixed(1)}×${d.z.toFixed(1)}</b></div>`}
+
+function renderIssues(issues){const list=document.getElementById('issueList');const ic={error:'✕',warn:'⚠'};if(!issues.length){list.innerHTML='<div class="issue-card"><div class="issue-icon ok">✓</div><div class="issue-info"><h4>No mesh issues</h4><p>Geometry is clean.</p></div></div>';document.getElementById('issueCount').textContent='0';document.getElementById('overallStatus').className='status-badge clean';document.getElementById('overallStatus').textContent='Clean';return}document.getElementById('issueCount').textContent=issues.length;const e=issues.filter(i=>i.type==='error').length;document.getElementById('overallStatus').className=e?'status-badge issues':'status-badge warning';document.getElementById('overallStatus').textContent=`${issues.length} Issue${issues.length>1?'s':''}`;list.innerHTML=issues.map(i=>`<div class="issue-card"><div class="issue-icon ${i.type}">${ic[i.type]||'⚠'}</div><div class="issue-info"><h4>${i.title}</h4><p>${i.desc}</p></div></div>`).join('')}
+
+function renderPrintability(p){document.getElementById('printabilitySection').style.display='block';const ps=document.getElementById('printStatus');if(p.print_difficulty==='Easy'){ps.className='status-badge clean';ps.textContent='Easy Print'}else if(p.print_difficulty==='Moderate'){ps.className='status-badge warning';ps.textContent='Moderate'}else{ps.className='status-badge issues';ps.textContent='Difficult'};const bar=document.getElementById('printBar');bar.children[0].style.width=p.printable_pct+'%';bar.children[1].style.width=p.warning_pct+'%';bar.children[2].style.width=p.fail_pct+'%';document.getElementById('printGoodPct').textContent=p.printable_pct+'% safe';document.getElementById('printWarnPct').textContent=p.warning_pct+'% risky';document.getElementById('printBadPct').textContent=p.fail_pct+'% fail';document.getElementById('printStatsGrid').innerHTML=`<div class="stat-card"><div class="stat-label">Overhangs</div><div class="stat-value ${p.overhang_faces>0?'bad':'good'}">${p.overhang_faces.toLocaleString()}</div></div><div class="stat-card"><div class="stat-label">Thin Walls</div><div class="stat-value ${p.thin_wall_faces>0?'bad':'good'}">${p.thin_wall_faces.toLocaleString()}</div></div><div class="stat-card"><div class="stat-label">Bridges</div><div class="stat-value ${p.bridge_faces>0?'bad':'good'}">${p.bridge_faces.toLocaleString()}</div></div><div class="stat-card"><div class="stat-label">Supports?</div><div class="stat-value ${p.support_needed?'bad':'good'}">${p.support_needed?'Needed':'No'}</div></div>`;document.getElementById('legendStats').innerHTML=`<div class="legend-stat"><span class="label">Overhangs</span><span class="value ${p.overhang_faces?'bad':'good'}">${p.overhang_area_pct}% area</span></div><div class="legend-stat"><span class="label">Thin walls</span><span class="value ${p.thin_wall_faces?'warn':'good'}">${p.thin_area_pct}% area</span></div><div class="legend-stat"><span class="label">Bridges</span><span class="value ${p.bridge_faces?'warn':'good'}">${p.bridge_faces} faces</span></div>`;const db=document.getElementById('difficultyBadge');db.textContent=p.print_difficulty;db.className='difficulty-badge '+p.print_difficulty.toLowerCase()}
+
+function switchView(v){S.viewMode=v;document.querySelectorAll('#meshToggle .view-btn').forEach(b=>b.classList.toggle('active',b.dataset.view===v));if(S.originalMesh)S.originalMesh.visible=(v==='original');if(S.repairedMesh)S.repairedMesh.visible=(v==='repaired');if(S.heatmapMesh)S.heatmapMesh.visible=(v==='heatmap');document.getElementById('heatmapLegend').classList.toggle('active',v==='heatmap');document.getElementById('heatmapFilters').classList.toggle('active',v==='heatmap');if(S.scene)S.scene.background=new THREE.Color(v==='heatmap'?0x050505:0x0a0a0a)}
+
+// ═══ ORIENT ═══
+const tagLabels={recommended:'Recommended',fastest:'Fastest Print',least_supports:'Least Supports',best_surface:'Best Surface'};
+
+function renderOrientCards(orientations){
+  const container=document.getElementById('orientCards');
+  container.innerHTML=orientations.map((o,i)=>{
+    const tags=o.tags.map(t=>`<span class="orient-tag ${t}">${tagLabels[t]||t}</span>`).join('');
+    return `<div class="orient-card${i===0?' selected':''}" data-idx="${i}">
+      <div class="orient-rank">#${i+1}</div>
+      <div class="orient-label">${o.label}</div>
+      <div class="orient-desc">${o.description}</div>
+      <div class="orient-tags">${tags}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('orientStatus').className='status-badge clean';
+  document.getElementById('orientStatus').textContent='3 options';
+
+  container.querySelectorAll('.orient-card').forEach(card=>{
+    card.addEventListener('click',()=>selectOrientation(parseInt(card.dataset.idx)));
+  });
+}
+
+async function selectOrientation(idx){
+  if(!S.orientData||!S.jobId)return;
+  const o=S.orientData.orientations[idx];
+  S.selectedOrient=idx;
+
+  // Update card selection
+  document.querySelectorAll('.orient-card').forEach((c,i)=>{
+    c.classList.toggle('selected',i===idx);
+    if(i===idx)c.classList.add('loading');
+  });
+
+  try{
+    // Fetch full heatmap for this orientation
+    const resp=await fetch(`/api/orient-heatmap/${S.jobId}`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rotation_matrix:o.rotation_matrix})
+    });
+    const data=await resp.json();
+
+    if(resp.ok&&data.vertex_colors){
+      // Replace heatmap mesh with rotated version
+      if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);
+      S.heatmapData=data;
+      S.heatmapMesh=buildHeatmapMesh(data.mesh_data,data.vertex_colors);
+
+      // Also replace the original mesh view with the rotated geometry
+      if(S.originalMesh)S.scene.remove(S.originalMesh);
+      S.originalMesh=buildMesh(data.mesh_data,0xcc8855,true);
+      S.meshData=data.mesh_data;
+
+      // Set visibility based on current view
+      S.originalMesh.visible=(S.viewMode==='original');
+      S.heatmapMesh.visible=(S.viewMode==='heatmap');
+      S.scene.add(S.originalMesh);
+      S.scene.add(S.heatmapMesh);
+
+      // Update printability display
+      renderPrintability(data.printability);
+
+      // Switch to heatmap view so they see the difference
+      switchView('heatmap');
+    }
+  }catch(err){
+    showToast('❌ '+err.message);
+  }
+
+  document.querySelectorAll('.orient-card').forEach(c=>c.classList.remove('loading'));
+}
+
+// ═══ UPLOAD ═══
+async function uploadFile(file){
+  const ov=document.getElementById('uploadOverlay');
+  ov.classList.add('active');
+  document.getElementById('uploadZone').classList.add('hidden');
+  document.getElementById('workspace').classList.add('active');
+  initThree();
+  document.getElementById('fileName').textContent=file.name;
+  document.getElementById('fileSize').textContent=(file.size/1024/1024).toFixed(2)+' MB';
+
+  try{
+    const form=new FormData();form.append('file',file);
+    const r=await fetch('/api/upload',{method:'POST',body:form});
+    const d=await r.json();
+    if(!r.ok){ov.classList.remove('active');showToast('❌ '+(d.error||'Upload failed'));return}
+    S.jobId=d.job_id;S.meshData=d.mesh_data;
+    if(d.mesh_data){S.originalMesh=buildMesh(d.mesh_data,0xcc8855,true);S.scene.add(S.originalMesh)}
+    renderStats(d.analysis.stats);renderIssues(d.analysis.issues);S.hasIssues=d.analysis.issues.length>0;
+
+    // Run printability heatmap
+    document.getElementById('overlayText').textContent='Running printability heatmap...';
+    const pr=await fetch(`/api/printability/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({build_direction:'z'})});
+    const pd=await pr.json();
+    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
+
+    // Run auto-orient (parallel feel — show results as they come)
+    document.getElementById('overlayText').textContent='Finding best print orientation...';
+    document.getElementById('orientSection').style.display='block';
+    const or=await fetch(`/api/orient/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    const od=await or.json();
+    ov.classList.remove('active');
+
+    if(or.ok&&od.orient){
+      S.orientData=od.orient;
+      renderOrientCards(od.orient.orientations);
+
+      // Auto-load the best orientation's heatmap
+      const best=od.orient.orientations[0];
+      if(best.rotation_matrix){
+        await selectOrientation(0);
+      }else{
+        // Original is already best — just switch to heatmap
+        setTimeout(()=>switchView('heatmap'),300);
+      }
+    }else{
+      setTimeout(()=>switchView('heatmap'),300);
+    }
+
+    const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
+    btn.disabled=false;
+    if(S.hasIssues){updateRepairButton();document.getElementById('freeLabel').textContent='Free heatmap, orient & analysis — sign up to repair'}
+    else{btn.className='repair-btn download';bt.innerHTML='⬇ Download Clean File';document.getElementById('freeLabel').textContent=''}
+  }catch(e){ov.classList.remove('active');showToast('❌ '+e.message);console.error(e)}
+}
+
+// ═══ REPAIR ═══
+let doRepair=async function(){}; // defined below after auth
+
+async function doDownload(){if(!S.jobId)return;
+  if(!authUser){showAuth('signup');return}
+  if(authUser.tier==='free'){showAuth('upgrade');return}
+  const btn=document.getElementById('repairBtn');btn.disabled=true;document.getElementById('repairBtnText').innerHTML='<div class="spinner"></div> Downloading...';
+  try{const fmt=S.downloadFormat||'stl';window.location.href=`/api/download/${S.jobId}?format=${fmt}`;showToast('📦 Downloading '+(fmt==='3mf'?'3MF':'STL')+'...')}catch(e){showToast('❌ '+e.message)}
+  btn.disabled=false;document.getElementById('repairBtnText').innerHTML='Download Print-Ready File';document.getElementById('fmtRow').style.display='flex'}
+
+// ═══ EVENTS ═══
+const dz=document.getElementById('dropzone'),fi=document.getElementById('fileInput');
+dz.addEventListener('click',()=>fi.click());
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});
+dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length)uploadFile(e.dataTransfer.files[0])});
+fi.addEventListener('change',e=>{if(e.target.files.length)uploadFile(e.target.files[0])});
+document.getElementById('repairBtn').addEventListener('click',()=>{
+  if(!authUser){showAuth('signup');return}
+  if(authUser.tier==='free'){showAuth('upgrade');return}
+  const u=authUser.usage||{used:0,limit:0};
+  if(u.used>=u.limit){showToast(`Monthly limit reached (${u.used}/${u.limit}). Contact us at hello@sliceready.co.`);return}
+  if(!S.repaired&&S.hasIssues)doRepair();else if(S.repaired)doDownload()
+});
+document.querySelectorAll('#meshToggle .view-btn').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
+document.querySelectorAll('.filter-btn').forEach(b=>b.addEventListener('click',()=>applyHeatmapFilter(b.dataset.filter)));
+document.getElementById('resetBtn').addEventListener('click',()=>{if(S.originalMesh)S.scene.remove(S.originalMesh);if(S.repairedMesh)S.scene.remove(S.repairedMesh);if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);Object.assign(S,{jobId:null,originalMesh:null,repairedMesh:null,heatmapMesh:null,repaired:false,hasIssues:false,heatmapData:null,meshData:null,orientData:null,selectedOrient:null,selectedFaces:[]});document.getElementById('workspace').classList.remove('active');document.getElementById('uploadZone').classList.remove('hidden');document.getElementById('heatmapLegend').classList.remove('active');document.getElementById('heatmapFilters').classList.remove('active');document.getElementById('repairSummary').classList.remove('active');document.getElementById('reportFailureBtn').style.display='none';document.getElementById('reportFailureBtn').disabled=false;document.getElementById('reportFailureBtn').textContent='🖨 Didn\'t print right?';document.getElementById('printabilitySection').style.display='none';document.getElementById('orientSection').style.display='none';document.getElementById('repairedBtn').style.display='none';document.getElementById('selectBar').classList.remove('active');document.getElementById('fmtRow').style.display='none';hideProgress();const c=document.getElementById('threeContainer');while(c.firstChild)c.removeChild(c.firstChild);S.renderer=null;S.scene=null;S.camera=null;fi.value=''});
+
+// ═══ FACE SELECTION (raycasting) ═══
+function onHeatmapClick(e){
+  if(S.viewMode!=='heatmap'||!S.heatmapMesh||!S.heatmapData)return;
+  const rect=S.renderer.domElement.getBoundingClientRect();
+  const mouse=new THREE.Vector2(((e.clientX-rect.left)/rect.width)*2-1,-((e.clientY-rect.top)/rect.height)*2+1);
+  S.raycaster.setFromCamera(mouse,S.camera);
+  const hits=S.raycaster.intersectObject(S.heatmapMesh);
+  if(hits.length===0)return;
+  const faceIdx=hits[0].faceIndex;
+  if(faceIdx===undefined)return;
+
+  // Toggle face and nearby faces (radius selection)
+  const scores=S.heatmapData.composite_scores;
+  const nFaces=scores.length;
+  // Select this face + neighbors with high scores (problem cluster)
+  const toSelect=new Set();
+  toSelect.add(faceIdx);
+
+  // Simple flood-fill to nearby problem faces (share vertices)
+  if(S.meshData){
+    const idx=S.meshData.indices||[];
+    const fVerts=new Set();
+    for(let v=faceIdx*3;v<faceIdx*3+3;v++){if(idx[v]!==undefined)fVerts.add(idx[v])}
+    for(let fi=0;fi<nFaces;fi++){
+      if(scores[fi]<0.25)continue; // skip clean faces
+      for(let v=fi*3;v<fi*3+3;v++){
+        if(fVerts.has(idx[v])){toSelect.add(fi);break}
+      }
+    }
+  }
+
+  // Add to selection (shift to add, otherwise replace)
+  if(!e.shiftKey)S.selectedFaces=[];
+  toSelect.forEach(fi=>{ if(!S.selectedFaces.includes(fi))S.selectedFaces.push(fi) });
+  updateSelectionVisual();
+}
+
+function updateSelectionVisual(){
+  const bar=document.getElementById('selectBar');
+  if(S.selectedFaces.length===0){bar.classList.remove('active');return}
+  bar.classList.add('active');
+  document.getElementById('selCount').textContent=S.selectedFaces.length+' faces';
+
+  // Highlight selected faces in white on the heatmap
+  if(!S.heatmapMesh||!S.heatmapData)return;
+  const n=S.heatmapData.composite_scores.length;
+  const selSet=new Set(S.selectedFaces);
+  const vc=new Float32Array(n*9);
+  for(let i=0;i<n;i++){
+    let c;
+    if(selSet.has(i)){c=[1,1,1]} // white highlight
+    else{c=scoreToColor(S.heatmapData.composite_scores[i])}
+    for(let v=0;v<3;v++){vc[i*9+v*3]=c[0];vc[i*9+v*3+1]=c[1];vc[i*9+v*3+2]=c[2]}
+  }
+  S.heatmapMesh.geometry.setAttribute('color',new THREE.BufferAttribute(vc,3));
+  S.heatmapMesh.geometry.attributes.color.needsUpdate=true;
+}
+
+// Selection buttons
+document.getElementById('selFixBtn').addEventListener('click',()=>doTargetedRepair('auto'));
+document.getElementById('selSmoothBtn').addEventListener('click',()=>doTargetedRepair('smooth'));
+document.getElementById('selClearBtn').addEventListener('click',()=>{
+  S.selectedFaces=[];updateSelectionVisual();
+  if(S.heatmapData&&S.heatmapMesh)applyHeatmapFilter(S.currentFilter);
+});
+
+async function doTargetedRepair(type){
+  if(!S.jobId||!S.selectedFaces.length)return;
+  const bar=document.getElementById('selectBar');
+  showToast('🔧 Repairing '+S.selectedFaces.length+' faces...');
+  try{
+    const resp=await fetch(`/api/repair-region/${S.jobId}`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({face_indices:S.selectedFaces,repair_type:type})
+    });
+    const data=await resp.json();
+    if(!resp.ok){showToast('❌ '+(data.error||'Failed'));return}
+
+    // Update mesh
+    if(data.mesh_data){
+      S.meshData=data.mesh_data;
+      if(S.repairedMesh)S.scene.remove(S.repairedMesh);
+      S.repairedMesh=buildMesh(data.mesh_data,0x00cc66,false);
+      S.repairedMesh.visible=false;
+      S.scene.add(S.repairedMesh);
+      document.getElementById('repairedBtn').style.display='';
+    }
+    if(data.analysis){renderStats(data.analysis.stats);renderIssues(data.analysis.issues)}
+    S.repaired=true;
+
+    // Re-run heatmap on repaired mesh
+    const pr=await fetch(`/api/printability/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({build_direction:'z'})});
+    const pd=await pr.json();
+    if(pr.ok&&pd.vertex_colors){
+      S.heatmapData=pd;
+      if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);
+      S.heatmapMesh=buildHeatmapMesh(data.mesh_data,pd.vertex_colors);
+      S.heatmapMesh.visible=(S.viewMode==='heatmap');
+      S.scene.add(S.heatmapMesh);
+      renderPrintability(pd.printability);
+    }
+
+    S.selectedFaces=[];
+    updateSelectionVisual();
+    showToast(`✅ Fixed ${data.faces_modified} faces — ${data.repairs.join(', ')}`);
+
+    // Update repair button state
+    const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
+    btn.disabled=false;btn.className='repair-btn download';
+    bt.innerHTML='⬇ Download Repaired File';
+    document.getElementById('fmtRow').style.display='flex';
+  }catch(e){showToast('❌ '+e.message)}
+}
+
+// Attach click listener to viewer (only fires on short clicks, not drags)
+let mouseDownTime=0,mouseDownPos={x:0,y:0};
+document.getElementById('threeContainer').addEventListener('mousedown',e=>{mouseDownTime=Date.now();mouseDownPos={x:e.clientX,y:e.clientY}});
+document.getElementById('threeContainer').addEventListener('mouseup',e=>{
+  const dt=Date.now()-mouseDownTime;
+  const dd=Math.abs(e.clientX-mouseDownPos.x)+Math.abs(e.clientY-mouseDownPos.y);
+  if(dt<300&&dd<5)onHeatmapClick(e); // short click, minimal movement
+});
+
+// ═══ FORMAT TOGGLE ═══
+document.querySelectorAll('.fmt-btn').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.fmt-btn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');S.downloadFormat=b.dataset.fmt;
+}));
+
+// ═══ AUTH SYSTEM ═══
+let authMode='signup';
+let currentUser=null;
+
+function showAuth(mode,title,sub){
+  authMode=mode||'signup';
+  document.getElementById('authOverlay').classList.add('active');
+  if(title){document.getElementById('authTitle').textContent=title;document.getElementById('authSub').textContent=sub||''}
+  switchAuthTab(authMode);
+  // Show upgrade content if user is logged in but on free tier
+  if(currentUser&&currentUser.tier==='free'){
+    document.getElementById('authContent').style.display='none';
+    document.getElementById('upgradeContent').style.display='block';
+  }else{
+    document.getElementById('authContent').style.display='block';
+    document.getElementById('upgradeContent').style.display='none';
+  }
+}
+function showUpgrade(){
+  document.getElementById('authOverlay').classList.add('active');
+  document.getElementById('authContent').style.display='none';
+  document.getElementById('upgradeContent').style.display='block';
+}
+function hideAuth(){document.getElementById('authOverlay').classList.remove('active');document.getElementById('authError').style.display='none'}
+
+function switchAuthTab(tab){
+  authMode=tab;
+  document.querySelectorAll('.auth-tab').forEach((t,i)=>t.classList.toggle('active',i===(tab==='signup'?0:1)));
+  document.getElementById('authSubmit').textContent=tab==='signup'?'Create Account':'Log In';
+}
+
+async function doAuth(){
+  const email=document.getElementById('authEmail').value.trim();
+  const password=document.getElementById('authPassword').value;
+  const errEl=document.getElementById('authError');
+  errEl.style.display='none';
+
+  const endpoint=authMode==='signup'?'/api/auth/signup':'/api/auth/login';
+  try{
+    const resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+    const data=await resp.json();
+    if(!resp.ok){errEl.textContent=data.error||'Something went wrong';errEl.style.display='block';return}
+
+    currentUser=data;
+    updateUserUI();
+
+    // If free tier, show upgrade immediately
+    if(data.tier==='free'){
+      document.getElementById('authContent').style.display='none';
+      document.getElementById('upgradeContent').style.display='block';
+    }else{
+      hideAuth();
+      showToast('✅ Logged in as '+data.email);
+    }
+  }catch(e){errEl.textContent=e.message;errEl.style.display='block'}
+}
+
+async function doSubscribe(){
+  try{
+    const resp=await fetch('/api/subscribe/maker',{method:'POST'});
+    const data=await resp.json();
+    if(data.demo){
+      currentUser.tier='maker';
+      currentUser.usage=data.usage;
+      updateUserUI();
+      hideAuth();
+      showToast('✅ Maker plan activated! 30 repairs/month unlocked.');
+    }else if(data.checkout_url){
+      window.location.href=data.checkout_url;
+    }else{
+      showToast('❌ '+(data.error||'Subscribe failed'));
+    }
+  }catch(e){showToast('❌ '+e.message)}
+}
+
+function updateUserUI(){
+  const bar=document.getElementById('userBar');
+  if(!currentUser||!currentUser.email){
+    bar.innerHTML='<button class="login-btn" onclick="showAuth()">Sign up free</button>';
+    return;
+  }
+  const tier=currentUser.tier||'free';
+  const used=currentUser.usage?currentUser.usage.used:0;
+  const limit=currentUser.usage?currentUser.usage.limit:0;
+
+  let tierBadge='';
+  if(tier==='maker')tierBadge='<span class="user-pill maker">Maker</span>';
+  else if(tier==='pro')tierBadge='<span class="user-pill pro">Pro</span>';
+  else tierBadge='<span class="user-pill">Free</span>';
+
+  let usageText='';
+  if(tier==='maker')usageText=`<span class="usage-pill">${used}/${limit} repairs</span>`;
+
+  let upgradeBtn='';
+  if(tier==='free')upgradeBtn='<button class="login-btn" onclick="showUpgrade()" style="font-size:10px">Upgrade $9/mo</button>';
+
+  bar.innerHTML=`${tierBadge}${usageText}${upgradeBtn}<span style="font-size:11px;color:var(--text-muted)">${currentUser.email.split('@')[0]}</span>`;
+}
+
+// Intercept repair/download errors for auth gating
+async function handleGatedAction(action){
+  try{return await action()}catch(e){throw e}
+}
+
+// Patch doRepair with full implementation
+doRepair=async function(){
+  if(!S.jobId)return;
+  const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
+  btn.disabled=true;bt.innerHTML='<div class="spinner"></div> Repairing...';showProgress('Repairing...',30);
+  try{
+    const r=await fetch(`/api/repair/${S.jobId}`,{method:'POST'});
+    const d=await r.json();
+    if(r.status===401){hideProgress();btn.disabled=false;showAuth('signup');return}
+    if(r.status===403){hideProgress();btn.disabled=false;showAuth('upgrade');return}
+    if(r.status===429){hideProgress();btn.disabled=false;showToast(`⚠️ Monthly limit reached (${d.used}/${d.limit}). Contact us at hello@sliceready.co.`);return}
+    if(!r.ok){hideProgress();showToast('❌ '+(d.error||'Failed'));btn.disabled=false;bt.innerHTML='🔧 Retry';return}
+
+    showProgress('Building preview...',80);
+    if(d.mesh_data){S.meshData=d.mesh_data;S.repairedMesh=buildMesh(d.mesh_data,0x00cc66,false);S.repairedMesh.visible=false;S.scene.add(S.repairedMesh);document.getElementById('repairedBtn').style.display=''}
+    if(d.analysis){renderStats(d.analysis.stats);renderIssues(d.analysis.issues)}
+
+    showProgress('Updating heatmap...',90);
+    const pr=await fetch(`/api/printability/${S.jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({build_direction:'z'})});
+    const pd=await pr.json();
+    if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;if(S.heatmapMesh)S.scene.remove(S.heatmapMesh);S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
+
+    document.getElementById('repairList').innerHTML=d.repairs.map(r=>`<li>${r}</li>`).join('');document.getElementById('repairSummary').classList.add('active');document.getElementById('reportFailureBtn').style.display='inline-block';S.repaired=true;document.getElementById('overallStatus').className='status-badge clean';document.getElementById('overallStatus').textContent='Repaired';showProgress('Done!',100);setTimeout(hideProgress,500);
+    if(d.usage&&authUser){authUser.usage=d.usage;updateAuthUI()}
+    updateRepairButton();switchView('repaired');showToast('✅ Repaired — check updated heatmap');
+  }catch(e){hideProgress();showToast('❌ '+e.message);btn.disabled=false;bt.innerHTML='🔧 Retry'}
+};
+
+// ═══ FAILURE REPORTING ═══
+let selectedFailureCat = '';
+function showFailureModal() {
+  selectedFailureCat = '';
+  document.querySelectorAll('.fo').forEach(b => b.classList.remove('selected'));
+  document.getElementById('failurePrinter').value = '';
+  document.getElementById('failureNotes').value = '';
+  document.getElementById('failureModal').classList.add('active');
+}
+function closeFailureModal() { document.getElementById('failureModal').classList.remove('active'); }
+function selectFailureCat(el) {
+  document.querySelectorAll('.fo').forEach(b => b.classList.remove('selected'));
+  el.classList.add('selected');
+  selectedFailureCat = el.dataset.cat;
+}
+async function submitFailure() {
+  if (!selectedFailureCat) { showToast('Please select what went wrong'); return; }
+  if (!S.jobId) return;
+  try {
+    const r = await fetch(`/api/report-failure/${S.jobId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: selectedFailureCat,
+        printer: document.getElementById('failurePrinter').value,
+        what_happened: document.getElementById('failureNotes').value,
+        slicer: ''
+      })
+    });
+    const d = await r.json();
+    closeFailureModal();
+    showToast('🙏 Thanks — this helps us make repairs better');
+    document.getElementById('reportFailureBtn').textContent = '✓ Failure reported';
+    document.getElementById('reportFailureBtn').disabled = true;
+  } catch(e) { showToast('❌ Failed to submit: ' + e.message); }
+}
+
+// ═══ AUTO-LOAD FROM LANDING PAGE ═══
+(async function(){
+  const params = new URLSearchParams(window.location.search);
+  const jobId = params.get('job');
+  if (!jobId) return;
+
+  // Skip upload zone, go straight to workspace
+  document.getElementById('uploadZone').classList.add('hidden');
+  document.getElementById('workspace').classList.add('active');
+  initThree();
+
+  const ov = document.getElementById('uploadOverlay');
+  ov.classList.add('active');
+  document.getElementById('overlayText').textContent = 'Loading analysis...';
+
+  try {
+    const r = await fetch(`/api/job/${jobId}`);
+    const d = await r.json();
+    if (!r.ok) { ov.classList.remove('active'); showToast('❌ ' + (d.error || 'Failed to load')); return; }
+
+    S.jobId = d.job_id;
+    S.meshData = d.mesh_data;
+    document.getElementById('fileName').textContent = d.original_name;
+    document.getElementById('fileSize').textContent = (d.file_size / 1024 / 1024).toFixed(2) + ' MB';
+
+    if (d.mesh_data) { S.originalMesh = buildMesh(d.mesh_data, 0xcc8855, true); S.scene.add(S.originalMesh); }
+    renderStats(d.analysis.stats); renderIssues(d.analysis.issues);
+    S.hasIssues = d.analysis.issues.length > 0;
+
+    // Heatmap
+    document.getElementById('overlayText').textContent = 'Running printability heatmap...';
+    const pr = await fetch(`/api/printability/${S.jobId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ build_direction: 'z' }) });
+    const pd = await pr.json();
+    if (pr.ok && pd.vertex_colors) { S.heatmapData = pd; S.heatmapMesh = buildHeatmapMesh(d.mesh_data, pd.vertex_colors); S.heatmapMesh.visible = false; S.scene.add(S.heatmapMesh); renderPrintability(pd.printability); }
+
+    // Orient
+    document.getElementById('overlayText').textContent = 'Finding best print orientation...';
+    document.getElementById('orientSection').style.display = 'block';
+    const or2 = await fetch(`/api/orient/${S.jobId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+    const od = await or2.json();
+    ov.classList.remove('active');
+
+    if (or2.ok && od.orient) {
+      S.orientData = od.orient;
+      renderOrientCards(od.orient.orientations);
+      const best = od.orient.orientations[0];
+      if (best.rotation_matrix) { await selectOrientation(0); }
+      else { setTimeout(() => switchView('heatmap'), 300); }
+    } else {
+      setTimeout(() => switchView('heatmap'), 300);
+    }
+
+    const btn = document.getElementById('repairBtn'), bt = document.getElementById('repairBtnText');
+    btn.disabled = false;
+    if (S.hasIssues) { updateRepairButton(); document.getElementById('freeLabel').textContent = 'Free heatmap, orient & analysis'; }
+    else { btn.className = 'repair-btn download'; bt.innerHTML = '⬇ Download Clean File'; document.getElementById('freeLabel').textContent = ''; }
+  } catch(e) { ov.classList.remove('active'); showToast('❌ ' + e.message); }
+})();
+
+</script>
+</body>
+</html>

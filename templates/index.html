@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0c0c0f">
+<title>SliceReady — From AI-Generated to Print-Ready</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0c0c0f;
+  --surface: #14141a;
+  --surface-2: #1c1c24;
+  --surface-3: #24242e;
+  --border: #2a2a35;
+  --text: #eeeef0;
+  --text-dim: #9494a0;
+  --green: #00e87b;
+  --green-dim: rgba(0,232,123,.12);
+  --green-glow: rgba(0,232,123,.25);
+  --orange: #ff8a3d;
+  --red: #ff4455;
+  --blue: #5588ff;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+html {
+  background: #0c0c0f !important;
+  color-scheme: dark;
+}
+body {
+  background: #0c0c0f !important;
+  color: var(--text);
+  font-family: 'Outfit', -apple-system, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── NAV ─── */
+nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 32px;
+  background: rgba(12,12,15,.85);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid rgba(255,255,255,.06);
+}
+.nav-logo {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 700; font-size: 19px; letter-spacing: -.3px;
+  text-decoration: none; color: var(--text);
+}
+.nav-logo-mark {
+  width: 30px; height: 30px;
+  background: var(--green);
+  border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+}
+.nav-logo-mark svg { width: 18px; height: 18px; }
+.nav-logo em { font-style: normal; color: var(--green); }
+.nav-links { display: flex; align-items: center; gap: 8px; }
+.nav-link {
+  padding: 8px 16px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; color: var(--text-dim);
+  text-decoration: none; transition: all .2s;
+}
+.nav-link:hover { color: var(--text); background: var(--surface-2); }
+.nav-cta {
+  padding: 8px 18px; border-radius: 8px;
+  font-size: 14px; font-weight: 600;
+  background: var(--green); color: var(--bg);
+  border: none; cursor: pointer; transition: all .2s;
+  text-decoration: none;
+}
+.nav-cta:hover { box-shadow: 0 4px 20px var(--green-glow); }
+
+/* ─── HERO ─── */
+.hero {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center;
+  padding: 120px 24px 60px;
+  position: relative;
+}
+.hero::before {
+  content: '';
+  position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+  width: 800px; height: 600px;
+  background: radial-gradient(ellipse, var(--green-dim) 0%, transparent 70%);
+  pointer-events: none;
+  opacity: .6;
+}
+
+.hero-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 16px 6px 8px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 100px;
+  font-size: 13px; color: var(--text-dim);
+  margin-bottom: 28px;
+  animation: fadeUp .6s ease both;
+}
+.hero-badge-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green-glow);
+  animation: pulse 2s ease infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+
+.hero h1 {
+  font-size: clamp(38px, 6vw, 68px);
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -2px;
+  max-width: 780px;
+  margin-bottom: 20px;
+  animation: fadeUp .6s ease .1s both;
+}
+.hero h1 .grad {
+  background: linear-gradient(135deg, var(--green), #44ddaa, var(--blue));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero-sub {
+  font-size: clamp(16px, 2.2vw, 20px);
+  color: var(--text-dim);
+  max-width: 560px;
+  line-height: 1.55;
+  font-weight: 400;
+  margin-bottom: 40px;
+  animation: fadeUp .6s ease .2s both;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── UPLOAD ZONE ─── */
+.upload-area {
+  width: 100%; max-width: 620px;
+  position: relative;
+  animation: fadeUp .6s ease .3s both;
+}
+
+.dropzone {
+  width: 100%;
+  border: 2px dashed var(--border);
+  border-radius: 20px;
+  padding: 52px 40px;
+  text-align: center;
+  cursor: pointer;
+  transition: all .35s ease;
+  background: var(--surface);
+  position: relative;
+  overflow: hidden;
+}
+.dropzone::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: radial-gradient(circle at 50% 50%, var(--green-dim), transparent 70%);
+  opacity: 0; transition: opacity .35s;
+}
+.dropzone:hover, .dropzone.dragover {
+  border-color: var(--green);
+  transform: translateY(-3px);
+  box-shadow: 0 12px 40px rgba(0,232,123,.08);
+}
+.dropzone:hover::after, .dropzone.dragover::after { opacity: 1; }
+
+.drop-icon-wrap {
+  width: 56px; height: 56px;
+  margin: 0 auto 20px;
+  border-radius: 14px;
+  background: var(--green-dim);
+  border: 1px solid rgba(0,232,123,.2);
+  display: flex; align-items: center; justify-content: center;
+  position: relative; z-index: 1;
+}
+.drop-icon-wrap svg { width: 26px; height: 26px; stroke: var(--green); }
+
+.drop-title {
+  font-size: 19px; font-weight: 600; margin-bottom: 8px;
+  position: relative; z-index: 1;
+}
+.drop-sub {
+  font-size: 15px; color: var(--text-dim); line-height: 1.5;
+  margin-bottom: 20px; position: relative; z-index: 1;
+}
+.drop-tags {
+  display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+  position: relative; z-index: 1;
+}
+.drop-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; padding: 5px 12px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-dim);
+}
+.file-input { display: none; }
+
+/* ─── TOOLS ROW ─── */
+.tools-row {
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  margin-top: 20px; flex-wrap: wrap;
+  animation: fadeUp .6s ease .45s both;
+}
+.tools-row span {
+  font-size: 13px; color: var(--text-dim); font-weight: 400;
+}
+.tool-chip {
+  font-size: 12px; font-weight: 500;
+  padding: 5px 12px; border-radius: 6px;
+  background: var(--surface-2); color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+/* ─── HOW IT WORKS ─── */
+.how-section {
+  padding: 80px 24px 100px;
+  max-width: 1060px;
+  margin: 0 auto;
+}
+.section-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 2px;
+  color: var(--green); margin-bottom: 16px;
+  text-align: center;
+}
+.section-title {
+  font-size: clamp(28px, 4vw, 42px);
+  font-weight: 700; letter-spacing: -1px;
+  text-align: center; margin-bottom: 56px;
+  line-height: 1.15;
+}
+
+.steps {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;
+}
+.step {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px 28px;
+  position: relative;
+  transition: all .3s;
+}
+.step:hover {
+  border-color: rgba(255,255,255,.1);
+  transform: translateY(-3px);
+}
+.step-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 600;
+  color: var(--green);
+  margin-bottom: 16px;
+  display: flex; align-items: center; gap: 8px;
+}
+.step-num::after {
+  content: '';
+  flex: 1; height: 1px;
+  background: var(--border);
+}
+.step-icon {
+  font-size: 32px; margin-bottom: 16px;
+  line-height: 1;
+}
+.step h3 {
+  font-size: 18px; font-weight: 600;
+  margin-bottom: 10px; line-height: 1.3;
+}
+.step p {
+  font-size: 14px; color: var(--text-dim); line-height: 1.6;
+}
+
+/* ─── PAIN POINTS ─── */
+.pain-section {
+  padding: 60px 24px 80px;
+  max-width: 700px;
+  margin: 0 auto;
+}
+.pain-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 36px 32px;
+  position: relative;
+  overflow: hidden;
+}
+.pain-card::before {
+  content: '';
+  position: absolute; top: -1px; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--red), var(--orange), var(--green));
+}
+.pain-quote {
+  font-size: 20px; font-weight: 500;
+  font-style: italic; line-height: 1.5;
+  margin-bottom: 20px;
+  color: var(--text);
+}
+.pain-quote span { color: var(--orange); font-weight: 600; font-style: normal; }
+.pain-answer {
+  font-size: 15px; line-height: 1.6;
+  color: var(--text-dim);
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.pain-answer strong { color: var(--green); font-weight: 600; }
+
+/* ─── FEATURE GRID ─── */
+.features-section {
+  padding: 60px 24px 100px;
+  max-width: 1060px; margin: 0 auto;
+}
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+.feature {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 24px;
+  transition: all .25s;
+}
+.feature:hover {
+  border-color: rgba(255,255,255,.08);
+}
+.feature-icon {
+  width: 40px; height: 40px;
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px;
+  margin-bottom: 16px;
+}
+.feature-icon.heatmap { background: rgba(255,100,50,.12); }
+.feature-icon.orient { background: rgba(85,136,255,.12); }
+.feature-icon.repair { background: var(--green-dim); }
+.feature-icon.batch { background: rgba(255,170,0,.12); }
+.feature-icon.click { background: rgba(200,120,255,.12); }
+.feature-icon.format { background: rgba(0,200,200,.12); }
+
+.feature h3 {
+  font-size: 16px; font-weight: 600; margin-bottom: 6px;
+}
+.feature p {
+  font-size: 13px; color: var(--text-dim); line-height: 1.55;
+}
+.feature .tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 600;
+  padding: 3px 8px; border-radius: 4px; margin-top: 10px;
+}
+.tag.free { background: var(--green-dim); color: var(--green); }
+.tag.maker { background: rgba(85,136,255,.12); color: var(--blue); }
+.tag.pro { background: rgba(255,170,0,.12); color: var(--orange); }
+
+/* ─── PRICING ─── */
+.pricing-section {
+  padding: 60px 24px 100px;
+  max-width: 900px; margin: 0 auto;
+}
+.pricing-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 16px; align-items: start;
+}
+.tier {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px 24px;
+  transition: all .3s;
+}
+.tier:hover { transform: translateY(-3px); }
+.tier.featured {
+  border-color: var(--green);
+  box-shadow: 0 8px 40px rgba(0,232,123,.08);
+  position: relative;
+}
+.tier.featured::before {
+  content: 'Most popular';
+  position: absolute; top: -12px; left: 50%; transform: translateX(-50%);
+  background: var(--green); color: var(--bg);
+  font-size: 11px; font-weight: 700;
+  padding: 4px 14px; border-radius: 100px;
+  text-transform: uppercase; letter-spacing: .5px;
+}
+.tier-name {
+  font-size: 14px; font-weight: 600; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: .5px;
+  margin-bottom: 8px;
+}
+.tier-price {
+  font-size: 42px; font-weight: 800;
+  letter-spacing: -2px;
+  margin-bottom: 4px;
+}
+.tier-price span {
+  font-size: 16px; font-weight: 400; color: var(--text-dim);
+  letter-spacing: 0;
+}
+.tier-desc {
+  font-size: 13px; color: var(--text-dim); margin-bottom: 24px;
+  line-height: 1.4;
+}
+.tier-features {
+  list-style: none; margin-bottom: 24px;
+}
+.tier-features li {
+  padding: 7px 0; font-size: 13px; color: var(--text-dim);
+  display: flex; align-items: center; gap: 10px;
+}
+.tier-features li::before {
+  content: '✓'; color: var(--green); font-weight: 700; font-size: 14px;
+  flex-shrink: 0;
+}
+.tier-btn {
+  display: block; width: 100%;
+  padding: 12px; border-radius: 10px;
+  font-size: 14px; font-weight: 600; font-family: 'Outfit', sans-serif;
+  text-align: center; cursor: pointer;
+  transition: all .2s; border: none;
+  text-decoration: none;
+}
+.tier-btn.primary {
+  background: var(--green); color: var(--bg);
+}
+.tier-btn.primary:hover { box-shadow: 0 4px 20px var(--green-glow); }
+.tier-btn.secondary {
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border);
+}
+.tier-btn.secondary:hover { border-color: var(--text-dim); }
+
+/* ─── CTA FOOTER ─── */
+.cta-footer {
+  text-align: center;
+  padding: 80px 24px 100px;
+  position: relative;
+}
+.cta-footer::before {
+  content: '';
+  position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+  width: 600px; height: 400px;
+  background: radial-gradient(ellipse, var(--green-dim), transparent 70%);
+  pointer-events: none; opacity: .4;
+}
+.cta-footer h2 {
+  font-size: clamp(28px, 4vw, 40px);
+  font-weight: 700; letter-spacing: -1px;
+  margin-bottom: 16px;
+}
+.cta-footer p {
+  font-size: 16px; color: var(--text-dim);
+  margin-bottom: 28px; max-width: 450px;
+  margin-left: auto; margin-right: auto;
+  line-height: 1.5;
+}
+.cta-big-btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 16px 36px; border-radius: 12px;
+  font-size: 17px; font-weight: 700; font-family: 'Outfit', sans-serif;
+  background: var(--green); color: var(--bg);
+  border: none; cursor: pointer; transition: all .2s;
+  text-decoration: none;
+  position: relative; z-index: 1;
+}
+.cta-big-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px var(--green-glow);
+}
+.cta-big-btn svg { width: 20px; height: 20px; }
+
+footer {
+  text-align: center;
+  padding: 24px;
+  font-size: 13px; color: var(--text-dim);
+  border-top: 1px solid var(--border);
+}
+
+/* ─── HERO MOCKUP ─── */
+.hero-mockup {
+  width: 100%; max-width: 820px;
+  margin-bottom: 48px;
+}
+.mockup-window {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0,0,0,.5), 0 0 80px rgba(0,232,123,.04);
+}
+.mockup-toolbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.mockup-dots { display: flex; gap: 6px; }
+.mockup-dots i {
+  display: block; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--surface-3);
+}
+.mockup-dots i:first-child { background: #ff5f57; }
+.mockup-dots i:nth-child(2) { background: #ffbd2e; }
+.mockup-dots i:last-child { background: #28c840; }
+.mockup-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--text-dim);
+  flex: 1; text-align: center;
+}
+.mockup-body {
+  display: grid; grid-template-columns: 1fr 220px;
+}
+.mockup-viewport {
+  position: relative;
+  background: var(--bg);
+  min-height: 360px;
+}
+.mockup-viewport canvas {
+  display: block; width: 100% !important; height: 100% !important;
+  position: absolute; inset: 0;
+}
+.mockup-overlay-btns {
+  position: absolute; top: 12px; left: 12px;
+  display: flex; gap: 4px;
+}
+.mo-btn {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; padding: 5px 10px; border-radius: 5px;
+  background: var(--surface); border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.mo-btn.active { background: var(--green); color: var(--bg); border-color: var(--green); font-weight: 600; }
+.mo-btn.fire { background: #ff6633; color: #fff; border-color: #ff6633; font-weight: 600; }
+.mockup-legend {
+  position: absolute; bottom: 12px; right: 12px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 14px; min-width: 140px;
+}
+.ml-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-dim); margin-bottom: 6px;
+}
+.ml-bar {
+  height: 8px; border-radius: 4px;
+  background: linear-gradient(90deg, #00dd44, #88cc00, #ddcc00, #ff8800, #ff3300);
+  margin-bottom: 4px;
+}
+.ml-labels {
+  display: flex; justify-content: space-between;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px; color: var(--text-dim);
+}
+.mockup-sidebar {
+  padding: 16px;
+  border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 16px;
+}
+.ms-section {}
+.ms-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-dim); margin-bottom: 10px;
+}
+.ms-issue {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text);
+  padding: 5px 0;
+}
+.ms-dot {
+  width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+}
+.ms-dot.red { background: var(--red); box-shadow: 0 0 6px rgba(255,68,85,.4); }
+.ms-dot.orange { background: var(--orange); box-shadow: 0 0 6px rgba(255,138,61,.4); }
+.ms-bar-track {
+  height: 6px; border-radius: 3px;
+  background: var(--surface-3); margin-bottom: 6px;
+}
+.ms-bar-fill {
+  height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, var(--orange), var(--red));
+}
+.ms-bar-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; color: var(--orange);
+}
+.ms-repair-btn {
+  margin-top: auto;
+  padding: 10px; border-radius: 8px;
+  background: var(--green); color: var(--bg);
+  font-size: 13px; font-weight: 700;
+  text-align: center;
+  box-shadow: 0 4px 16px var(--green-glow);
+}
+
+/* ─── WHY SWITCH ─── */
+.switch-section {
+  padding: 60px 24px 80px;
+  max-width: 1060px; margin: 0 auto;
+}
+.switch-grid {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+.switch-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 24px;
+  transition: all .3s;
+}
+.switch-card:hover {
+  border-color: rgba(255,255,255,.08);
+  transform: translateY(-2px);
+}
+.switch-tool {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  display: flex; align-items: center; gap: 8px;
+}
+.switch-tool::before {
+  content: '×';
+  display: flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; border-radius: 4px;
+  background: rgba(255,68,85,.12); color: var(--red);
+  font-size: 12px; font-weight: 700;
+}
+.switch-pain {
+  font-size: 15px; font-style: italic;
+  color: var(--text); line-height: 1.5;
+  margin-bottom: 16px;
+}
+.switch-line {
+  height: 1px; background: var(--border);
+  margin-bottom: 16px;
+}
+.switch-answer {
+  font-size: 13px; color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* ─── RESPONSIVE ─── */
+@media (max-width: 768px) {
+  nav { padding: 12px 16px; }
+  .nav-links .nav-link { display: none; }
+  .steps { grid-template-columns: 1fr; }
+  .features-grid { grid-template-columns: 1fr; }
+  .pricing-grid { grid-template-columns: 1fr; max-width: 380px; margin: 0 auto; }
+  .switch-grid { grid-template-columns: 1fr; }
+  .hero { padding: 100px 20px 40px; }
+  .dropzone { padding: 40px 24px; }
+  .mockup-body { grid-template-columns: 1fr; }
+  .mockup-sidebar { display: none; }
+  .mockup-viewport { min-height: 220px; }
+}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a class="nav-logo" href="/">
+    <div class="nav-logo-mark">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#0c0c0f" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+      </svg>
+    </div>
+    <span>Slice<em>Ready</em></span>
+  </a>
+  <div class="nav-links">
+    <a class="nav-link" href="#features">Features</a>
+    <a class="nav-link" href="#pricing">Pricing</a>
+    <a class="nav-cta" href="#upload">Upload free</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-badge">
+    <div class="hero-badge-dot"></div>
+    No install. Works in your browser.
+  </div>
+
+  <h1>Your AI model looks amazing.<br><span class="grad">Now make it print-ready.</span></h1>
+
+  <p class="hero-sub">
+    AI tools create incredible 3D models in seconds — Meshy, Tripo, CSM, and more.
+    SliceReady is the last step — optimizing any AI-generated model for your printer so every print comes out perfect.
+  </p>
+
+  <!-- HERO MOCKUP -->
+  <div class="hero-mockup" style="animation: fadeUp .6s ease .25s both">
+    <div class="mockup-window">
+      <div class="mockup-toolbar">
+        <div class="mockup-dots"><i></i><i></i><i></i></div>
+        <div class="mockup-title">dragon_v3.stl — SliceReady</div>
+      </div>
+      <div class="mockup-body">
+        <div class="mockup-viewport" id="heroViewport">
+          <div class="mockup-overlay-btns">
+            <span class="mo-btn">Original</span>
+            <span class="mo-btn fire active">🔥 Heatmap</span>
+          </div>
+          <div class="mockup-legend">
+            <div class="ml-title">Printability</div>
+            <div class="ml-bar"></div>
+            <div class="ml-labels"><span>Safe</span><span>Risk</span><span>Fail</span></div>
+          </div>
+        </div>
+        <div class="mockup-sidebar">
+          <div class="ms-section">
+            <div class="ms-label">Issues Found</div>
+            <div class="ms-issue"><span class="ms-dot red"></span>23 non-manifold edges</div>
+            <div class="ms-issue"><span class="ms-dot red"></span>4 holes detected</div>
+            <div class="ms-issue"><span class="ms-dot orange"></span>12 flipped normals</div>
+            <div class="ms-issue"><span class="ms-dot orange"></span>Thin walls &lt; 0.4mm</div>
+          </div>
+          <div class="ms-section">
+            <div class="ms-label">Overhang Coverage</div>
+            <div class="ms-bar-track"><div class="ms-bar-fill" style="width:34%"></div></div>
+            <div class="ms-bar-val">34% of faces at risk</div>
+          </div>
+          <div class="ms-repair-btn">🔧 Repair & Make Print-Ready</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- UPLOAD -->
+  <div class="upload-area" id="upload">
+    <div class="dropzone" id="dropzone">
+      <div class="drop-icon-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <div class="drop-title">Drop your STL file here</div>
+      <div class="drop-sub">or click to browse — up to 100 MB</div>
+      <div class="drop-tags">
+        <span class="drop-tag">.STL</span>
+        <span class="drop-tag">Binary & ASCII</span>
+        <span class="drop-tag">Free analysis</span>
+      </div>
+      <input type="file" class="file-input" id="fileInput" accept=".stl">
+    </div>
+  </div>
+
+  <div class="tools-row">
+    <span>Supercharges models from</span>
+    <span class="tool-chip">Meshy</span>
+    <span class="tool-chip">Tripo</span>
+    <span class="tool-chip">CSM</span>
+    <span class="tool-chip">Blender</span>
+    <span class="tool-chip">TinkerCAD</span>
+    <span class="tool-chip">Fusion 360</span>
+    <span class="tool-chip">Any STL</span>
+  </div>
+</section>
+
+<!-- THE GAP -->
+<section class="pain-section">
+  <div class="pain-card">
+    <div class="pain-quote">
+      "I generated an incredible dragon in Meshy in 30 seconds. Sliced it, printed for 6 hours…
+      and it came out as <span>spaghetti</span>."
+    </div>
+    <div class="pain-answer">
+      AI 3D tools are magic at creating models. But printers are brutally literal — they need watertight geometry, correct normals, and walls thick enough for your nozzle.
+      SliceReady bridges that gap. <strong>Generate with AI. Print with confidence.</strong>
+    </div>
+  </div>
+</section>
+
+<!-- WHY SWITCH -->
+<section class="switch-section">
+  <div class="section-label">Sound familiar?</div>
+  <h2 class="section-title">The tools you've tried. And why they didn't stick.</h2>
+
+  <div class="switch-grid">
+    <div class="switch-card">
+      <div class="switch-tool">Meshmixer</div>
+      <div class="switch-pain">"Last updated 2018. That's before Bambu existed. Before AI-generated models existed. Before cloud computing existed. But sure, it's still the top recommendation on Reddit. LOL"</div>
+      <div class="switch-line"></div>
+      <div class="switch-answer">SliceReady runs in your browser. No download, no install, no praying it doesn't crash on a 30MB file. Works on Mac, Windows, Linux, Chromebook, whatever you've got.</div>
+    </div>
+    <div class="switch-card">
+      <div class="switch-tool">Formware</div>
+      <div class="switch-pain">"My file hit the 4-minute processing limit and just… vanished. No error. No download. Gone. Like it never existed. Cool, cool, cool."</div>
+      <div class="switch-line"></div>
+      <div class="switch-answer">SliceReady shows you a heatmap of every problem before it touches anything. Click a red zone to fix just that area. Nothing vanishes. Nothing's a mystery. You see what's wrong, you decide what to fix.</div>
+    </div>
+    <div class="switch-card">
+      <div class="switch-tool">Netfabb / Magics</div>
+      <div class="switch-pain">"It's $5,000 a year. I'm a dad printing dinosaurs for my kid on a Bambu in the garage. I am not a mechanical engineer at Lockheed Martin."</div>
+      <div class="switch-line"></div>
+      <div class="switch-answer">SliceReady starts free. The Maker plan is $9/month — less than a roll of PLA. You get the heatmap, targeted repair, and auto-orient. The stuff that actually saves your prints.</div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="how-section">
+  <div class="section-label">How it works</div>
+  <h2 class="section-title">Upload. See the problems. Fix them.</h2>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-icon">📤</div>
+      <h3>Drop your file</h3>
+      <p>Upload any STL straight from Meshy, Tripo, Blender, or wherever you create. No account needed to see the full analysis.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-icon">🔥</div>
+      <h3>See the heatmap</h3>
+      <p>A color-coded 3D view highlights every overhang, thin wall, and bridging challenge. Green means print-ready. Red means needs attention.</p>
+    </div>
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-icon">✅</div>
+      <h3>One-click optimize</h3>
+      <p>Hit repair. SliceReady fixes geometry, fills gaps, and validates through the Manifold engine (same as PrusaSlicer). Your AI-generated masterpiece is now printer-perfect.</p>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="features-section" id="features">
+  <div class="section-label">Features</div>
+  <h2 class="section-title">Everything between "generate" and "print"</h2>
+
+  <div class="features-grid">
+    <div class="feature">
+      <div class="feature-icon heatmap">🔥</div>
+      <h3>Printability heatmap</h3>
+      <p>See overhangs, thin walls, and bridging areas color-coded directly on your model. Understand exactly what your printer needs before you slice.</p>
+      <span class="tag free">Free</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon orient">🧭</div>
+      <h3>Auto-orient</h3>
+      <p>SliceReady tests orientations and ranks them by print success. Less supports, fewer failures, better surface finish.</p>
+      <span class="tag free">Free</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon repair">🔧</div>
+      <h3>One-click repair</h3>
+      <p>Fixes geometry and validates through the Manifold engine — the same tech inside PrusaSlicer and Blender. Download as STL or 3MF.</p>
+      <span class="tag maker">Maker $9/mo</span>
+    </div>
+    <div class="feature">
+      <div class="feature-icon click">🎯</div>
+      <h3>Click-to-fix</h3>
+      <p>Click a problem area on the heatmap and fix just that region. Non-destructive — the rest of your model stays untouched.</p>
+      <span class="tag maker">Maker $9/mo</span>
+    </div>
+  </div>
+</section>
+
+<!-- PRICING -->
+<section class="pricing-section" id="pricing">
+  <div class="section-label">Pricing</div>
+  <h2 class="section-title">Free to see what's wrong.<br>Subscribe to fix it.</h2>
+
+  <div class="pricing-grid" style="grid-template-columns: repeat(2, 1fr); max-width: 700px; margin: 0 auto;">
+    <div class="tier">
+      <div class="tier-name">Free</div>
+      <div class="tier-price">$0</div>
+      <div class="tier-desc">See every problem. No account needed.</div>
+      <ul class="tier-features">
+        <li>Unlimited uploads</li>
+        <li>Printability heatmap</li>
+        <li>Issue detection</li>
+        <li>Auto-orient recommendations</li>
+      </ul>
+      <a class="tier-btn secondary" href="#upload">Upload now</a>
+    </div>
+
+    <div class="tier featured">
+      <div class="tier-name">Maker</div>
+      <div class="tier-price">$9<span>/mo</span></div>
+      <div class="tier-desc">30 repairs a month. More than enough for weekly prints.</div>
+      <ul class="tier-features">
+        <li>Everything in Free</li>
+        <li>30 repairs &amp; downloads per month</li>
+        <li>Click-to-fix targeted repair</li>
+        <li>Export STL + 3MF</li>
+        <li>Manifold-validated output</li>
+      </ul>
+      <button class="tier-btn primary">Start Maker plan</button>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-footer">
+  <h2>Generate it. Print it. That simple.</h2>
+  <p>Upload your first file free. See the heatmap in 10 seconds. No account, no install, no credit card.</p>
+  <a class="cta-big-btn" href="#upload">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+    </svg>
+    Upload your STL
+  </a>
+</section>
+
+<footer>
+  © 2026 SliceReady · The bridge between AI creation and 3D printing
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// Hero 3D heatmap preview
+(function() {
+  const container = document.getElementById('heroViewport');
+  if (!container) return;
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0c0c0f);
+
+  const w = container.clientWidth || 580;
+  const h = container.clientHeight || 340;
+  const camera = new THREE.PerspectiveCamera(35, w / h, 0.1, 100);
+  camera.position.set(3.5, 2, 4);
+  camera.lookAt(0, 0.2, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(w, h);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  container.insertBefore(renderer.domElement, container.firstChild);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.7);
+  dl.position.set(5, 8, 5);
+  scene.add(dl);
+
+  // Build an organic shape — torusKnot looks like a complex AI-generated form
+  const geo = new THREE.TorusKnotGeometry(1.1, 0.38, 200, 32, 2, 3);
+
+  // Heatmap vertex colors based on normals (overhang = face pointing down)
+  const colors = new Float32Array(geo.attributes.position.count * 3);
+  const pos = geo.attributes.position;
+  const norm = geo.attributes.normal;
+
+  // Color ramp: green (safe) → yellow → orange → red (fail)
+  function heatToRGB(t) {
+    t = Math.max(0, Math.min(1, t));
+    let r, g, b;
+    if (t < 0.25) {
+      r = t / 0.25 * 0.53; g = 0.87 - t / 0.25 * 0.07; b = 0.27 - t / 0.25 * 0.24;
+    } else if (t < 0.5) {
+      const s = (t - 0.25) / 0.25;
+      r = 0.53 + s * 0.34; g = 0.8 - s * 0.0; b = 0.03;
+    } else if (t < 0.75) {
+      const s = (t - 0.5) / 0.25;
+      r = 0.87 + s * 0.13; g = 0.8 - s * 0.46; b = 0.03 - s * 0.03;
+    } else {
+      const s = (t - 0.75) / 0.25;
+      r = 1.0; g = 0.34 - s * 0.14; b = 0.0;
+    }
+    return [r, g, b];
+  }
+
+  for (let i = 0; i < pos.count; i++) {
+    const ny = norm.getY(i);
+    const py = pos.getY(i);
+
+    // Overhang: normal pointing down (ny < 0)
+    let heat = 0;
+
+    // Strong overhang signal from downward-facing normals
+    if (ny < 0) heat += Math.pow(-ny, 1.5) * 0.7;
+
+    // Bottom of model = unsupported
+    if (py < -0.6) heat += 0.2;
+
+    // Thin bridges at extremes
+    const px = pos.getX(i);
+    const pz = pos.getZ(i);
+    const radial = Math.sqrt(px * px + pz * pz);
+    if (radial > 1.3) heat += 0.15;
+
+    // Small noise for realism
+    heat += (Math.sin(px * 8) * Math.cos(pz * 6) * 0.06);
+
+    const [r, g, b] = heatToRGB(heat);
+    colors[i * 3] = r;
+    colors[i * 3 + 1] = g;
+    colors[i * 3 + 2] = b;
+  }
+
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mat = new THREE.MeshPhongMaterial({
+    vertexColors: true,
+    shininess: 20,
+    flatShading: true,
+    side: THREE.DoubleSide
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.x = 0.3;
+  scene.add(mesh);
+
+  // Subtle wireframe overlay
+  const wire = new THREE.Mesh(
+    geo,
+    new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.04 })
+  );
+  wire.rotation.copy(mesh.rotation);
+  scene.add(wire);
+
+  // Subtle grid floor
+  const grid = new THREE.GridHelper(8, 20, 0x222230, 0x18181f);
+  grid.position.y = -1.6;
+  scene.add(grid);
+
+  function animate() {
+    requestAnimationFrame(animate);
+    mesh.rotation.y += 0.003;
+    wire.rotation.y = mesh.rotation.y;
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // Resize
+  window.addEventListener('resize', () => {
+    const nw = container.clientWidth;
+    const nh = container.clientHeight;
+    if (nw && nh) {
+      camera.aspect = nw / nh;
+      camera.updateProjectionMatrix();
+      renderer.setSize(nw, nh);
+    }
+  });
+})();
+
+// Dropzone interaction
+const dz = document.getElementById('dropzone');
+const fi = document.getElementById('fileInput');
+
+dz.addEventListener('click', () => fi.click());
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fi.addEventListener('change', e => { if (e.target.files.length) handleFile(e.target.files[0]); });
+
+function handleFile(file) {
+  if (!file.name.toLowerCase().endsWith('.stl')) {
+    alert('Please upload an STL file');
+    return;
+  }
+  const dz = document.getElementById('dropzone');
+  dz.querySelector('.drop-title').textContent = file.name;
+  dz.querySelector('.drop-sub').textContent =
+    (file.size / 1024 / 1024).toFixed(1) + ' MB — Analyzing...';
+  dz.style.borderColor = 'var(--green)';
+  dz.style.pointerEvents = 'none';
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/api/upload', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(d => {
+      if (d.job_id) {
+        window.location.href = '/app?job=' + d.job_id;
+      } else {
+        dz.querySelector('.drop-sub').textContent = d.error || 'Upload failed';
+        dz.style.borderColor = 'var(--red)';
+        dz.style.pointerEvents = 'auto';
+      }
+    })
+    .catch(e => {
+      dz.querySelector('.drop-sub').textContent = 'Upload failed — ' + e.message;
+      dz.style.borderColor = 'var(--red)';
+      dz.style.pointerEvents = 'auto';
+    });
+}
+
+// Smooth scroll for anchor links
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth' });
+  });
+});
+</script>
+</body>
+</html>

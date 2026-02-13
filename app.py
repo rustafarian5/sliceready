@@ -1,0 +1,2401 @@
+"""
+SliceReady — AI-generated 3D model repair service
+Flask backend with real mesh analysis and repair via trimesh + pymeshfix
+"""
+
+import os
+import uuid
+import json
+import time
+import hashlib
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from functools import wraps
+
+import numpy as np
+import trimesh
+import pymeshfix
+import manifold3d
+from flask import Flask, request, jsonify, send_file, render_template, abort, session, redirect
+
+# ──────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'uploads')
+app.config['REPAIRED_FOLDER'] = os.path.join(os.path.dirname(__file__), 'repaired')
+app.config['STRIPE_SECRET_KEY'] = os.environ.get('STRIPE_SECRET_KEY', '')
+app.config['STRIPE_MAKER_PRICE_ID'] = os.environ.get('STRIPE_MAKER_PRICE_ID', '')  # Stripe recurring price
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'sliceready-dev-' + uuid.uuid4().hex[:16])
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['REPAIRED_FOLDER'], exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('sliceready')
+
+# In-memory stores (swap for DB in production)
+jobs = {}
+users = {}  # email -> user dict
+repair_ledger = []  # every repair logged for learning
+print_failures = []  # user-reported failures
+
+# ──────────────────────────────────────────────
+# Subscription tiers
+# ──────────────────────────────────────────────
+TIERS = {
+    'free': {
+        'name': 'Free',
+        'price': 0,
+        'repairs_per_month': 0,
+        'batch': False,
+        'api': False,
+        'targeted_repair': False,
+    },
+    'maker': {
+        'name': 'Maker',
+        'price': 9,
+        'repairs_per_month': 30,
+        'batch': False,
+        'api': False,
+        'targeted_repair': True,
+    },
+    'pro': {
+        'name': 'Pro',
+        'price': 49,
+        'repairs_per_month': 999999,  # unlimited
+        'batch': True,
+        'api': True,
+        'targeted_repair': True,
+    }
+}
+
+
+# ──────────────────────────────────────────────
+# Auth helpers
+# ──────────────────────────────────────────────
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def get_current_user():
+    """Return current user dict or None."""
+    email = session.get('user_email')
+    if email and email in users:
+        return users[email]
+    return None
+
+
+def get_usage_key():
+    """Monthly usage key: 'YYYY-MM'"""
+    return datetime.utcnow().strftime('%Y-%m')
+
+
+def get_user_usage(user):
+    """Return (used, limit) for current month."""
+    key = get_usage_key()
+    usage = user.get('usage', {})
+    used = usage.get(key, 0)
+    tier = TIERS.get(user.get('tier', 'free'), TIERS['free'])
+    limit = tier['repairs_per_month']
+    return used, limit
+
+
+def increment_usage(user):
+    """Increment repair count for current month."""
+    key = get_usage_key()
+    if 'usage' not in user:
+        user['usage'] = {}
+    user['usage'][key] = user['usage'].get(key, 0) + 1
+
+
+def require_auth(f):
+    """Decorator: require logged-in user."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Login required', 'auth_required': True}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_tier(min_tier):
+    """Decorator: require minimum subscription tier."""
+    tier_order = ['free', 'maker', 'pro']
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({'error': 'Login required', 'auth_required': True}), 401
+            user_tier = user.get('tier', 'free')
+            if tier_order.index(user_tier) < tier_order.index(min_tier):
+                return jsonify({
+                    'error': f'{TIERS[min_tier]["name"]} plan required',
+                    'upgrade_required': True,
+                    'current_tier': user_tier,
+                    'required_tier': min_tier
+                }), 403
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+
+# ──────────────────────────────────────────────
+# Auth endpoints
+# ──────────────────────────────────────────────
+@app.route('/api/auth/signup', methods=['POST'])
+def signup():
+    body = request.get_json(silent=True) or {}
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '')
+
+    if not email or '@' not in email:
+        return jsonify({'error': 'Valid email required'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be 6+ characters'}), 400
+    if email in users:
+        return jsonify({'error': 'Account already exists. Try logging in.'}), 409
+
+    users[email] = {
+        'email': email,
+        'password': hash_password(password),
+        'tier': 'free',
+        'usage': {},
+        'created_at': datetime.utcnow().isoformat(),
+        'stripe_customer_id': None,
+        'stripe_subscription_id': None
+    }
+    session['user_email'] = email
+    logger.info(f"Signup: {email}")
+
+    return jsonify({
+        'email': email,
+        'tier': 'free',
+        'usage': {'used': 0, 'limit': 0}
+    })
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    body = request.get_json(silent=True) or {}
+    email = body.get('email', '').strip().lower()
+    password = body.get('password', '')
+
+    if email not in users:
+        return jsonify({'error': 'Account not found'}), 404
+    if users[email]['password'] != hash_password(password):
+        return jsonify({'error': 'Wrong password'}), 401
+
+    session['user_email'] = email
+    user = users[email]
+    used, limit = get_user_usage(user)
+    logger.info(f"Login: {email} (tier={user['tier']})")
+
+    return jsonify({
+        'email': email,
+        'tier': user['tier'],
+        'usage': {'used': used, 'limit': limit}
+    })
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.pop('user_email', None)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/auth/me')
+def auth_me():
+    user = get_current_user()
+    if not user:
+        return jsonify({'logged_in': False}), 200
+    used, limit = get_user_usage(user)
+    return jsonify({
+        'logged_in': True,
+        'email': user['email'],
+        'tier': user['tier'],
+        'usage': {'used': used, 'limit': limit},
+        'tier_info': TIERS[user.get('tier', 'free')]
+    })
+
+
+# ──────────────────────────────────────────────
+# Subscription / Stripe
+# ──────────────────────────────────────────────
+@app.route('/api/subscribe/maker', methods=['POST'])
+@require_auth
+def subscribe_maker():
+    """Create Stripe Checkout session for Maker subscription, or activate in demo mode."""
+    user = get_current_user()
+
+    if user['tier'] == 'maker':
+        return jsonify({'error': 'Already on Maker plan'}), 400
+
+    if app.config['STRIPE_SECRET_KEY'] and app.config['STRIPE_MAKER_PRICE_ID']:
+        import stripe
+        stripe.api_key = app.config['STRIPE_SECRET_KEY']
+
+        try:
+            # Create or reuse Stripe customer
+            if not user.get('stripe_customer_id'):
+                customer = stripe.Customer.create(email=user['email'])
+                user['stripe_customer_id'] = customer.id
+
+            checkout = stripe.checkout.Session.create(
+                customer=user['stripe_customer_id'],
+                mode='subscription',
+                line_items=[{'price': app.config['STRIPE_MAKER_PRICE_ID'], 'quantity': 1}],
+                success_url=request.host_url + 'api/subscribe/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url=request.host_url,
+                metadata={'email': user['email'], 'tier': 'maker'}
+            )
+            return jsonify({'checkout_url': checkout.url})
+
+        except Exception as e:
+            logger.error(f"Stripe error: {e}")
+            return jsonify({'error': str(e)}), 500
+    else:
+        # Demo mode — activate immediately
+        user['tier'] = 'maker'
+        used, limit = get_user_usage(user)
+        logger.info(f"Demo upgrade: {user['email']} → maker")
+        return jsonify({
+            'demo': True,
+            'message': 'Maker plan activated (demo mode — set STRIPE_SECRET_KEY for live billing)',
+            'tier': 'maker',
+            'usage': {'used': used, 'limit': limit}
+        })
+
+
+@app.route('/api/subscribe/success')
+def subscribe_success():
+    """Handle Stripe checkout success redirect."""
+    session_id = request.args.get('session_id')
+    if not session_id:
+        return redirect('/')
+
+    if app.config['STRIPE_SECRET_KEY']:
+        import stripe
+        stripe.api_key = app.config['STRIPE_SECRET_KEY']
+        try:
+            checkout = stripe.checkout.Session.retrieve(session_id)
+            email = checkout.metadata.get('email')
+            if email and email in users:
+                users[email]['tier'] = 'maker'
+                users[email]['stripe_subscription_id'] = checkout.subscription
+                logger.info(f"Subscription activated: {email} → maker")
+        except Exception as e:
+            logger.error(f"Stripe success error: {e}")
+
+    return redirect('/')
+
+
+@app.route('/api/subscribe/cancel', methods=['POST'])
+@require_auth
+def cancel_subscription():
+    """Cancel subscription (revert to free)."""
+    user = get_current_user()
+
+    if app.config['STRIPE_SECRET_KEY'] and user.get('stripe_subscription_id'):
+        import stripe
+        stripe.api_key = app.config['STRIPE_SECRET_KEY']
+        try:
+            stripe.Subscription.modify(user['stripe_subscription_id'], cancel_at_period_end=True)
+        except Exception as e:
+            logger.warning(f"Stripe cancel error: {e}")
+
+    user['tier'] = 'free'
+    return jsonify({'tier': 'free', 'message': 'Subscription cancelled'})
+
+
+# ──────────────────────────────────────────────
+# Mesh Analysis Engine
+# ──────────────────────────────────────────────
+def analyze_mesh(mesh):
+    """Run comprehensive analysis on a trimesh object. Returns dict of findings."""
+    issues = []
+    stats = {}
+
+    # Basic stats
+    stats['triangles'] = len(mesh.faces)
+    stats['vertices'] = len(mesh.vertices)
+    bounds = mesh.bounds
+    dims = bounds[1] - bounds[0]
+    stats['dimensions'] = {
+        'x': round(float(dims[0]), 3),
+        'y': round(float(dims[1]), 3),
+        'z': round(float(dims[2]), 3)
+    }
+    stats['volume'] = round(float(mesh.volume), 4) if mesh.is_volume else None
+    stats['is_watertight'] = bool(mesh.is_watertight)
+    stats['is_volume'] = bool(mesh.is_volume)
+    stats['euler_number'] = int(mesh.euler_number)
+
+    # ── Non-manifold edges ──
+    # Edges shared by != 2 faces
+    edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+    edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+    unique_edges, edge_counts = np.unique(edge_keys, return_counts=True)
+    non_manifold_count = int(np.sum(edge_counts != 2))
+    stats['non_manifold_edges'] = non_manifold_count
+
+    if non_manifold_count > 0:
+        issues.append({
+            'type': 'error',
+            'title': 'Non-manifold edges',
+            'desc': f'{non_manifold_count:,} edges are shared by ≠ 2 faces. Model is not watertight.',
+            'severity': 3
+        })
+
+    # ── Inverted / inconsistent normals ──
+    if not mesh.is_watertight:
+        # Check face winding consistency
+        # trimesh can detect this via broken faces
+        broken = mesh.faces[trimesh.repair.broken_faces(mesh)] if hasattr(trimesh.repair, 'broken_faces') else []
+        if hasattr(mesh, 'face_adjacency_unshared'):
+            pass  # trimesh handles this internally
+        issues.append({
+            'type': 'error' if not mesh.is_watertight else 'warn',
+            'title': 'Mesh not watertight',
+            'desc': 'The mesh has open boundaries or inconsistent face winding. Slicers may produce artifacts.',
+            'severity': 3
+        })
+
+    # ── Degenerate faces ──
+    areas = mesh.area_faces
+    degenerate_count = int(np.sum(areas < 1e-10))
+    stats['degenerate_faces'] = degenerate_count
+
+    if degenerate_count > 0:
+        issues.append({
+            'type': 'warn',
+            'title': 'Degenerate triangles',
+            'desc': f'{degenerate_count:,} zero-area triangles found. These cause slicing artifacts.',
+            'severity': 2
+        })
+
+    # ── Duplicate faces ──
+    face_sorted = np.sort(mesh.faces, axis=1)
+    _, face_unique_counts = np.unique(face_sorted, axis=0, return_counts=True)
+    duplicate_faces = int(np.sum(face_unique_counts > 1))
+    stats['duplicate_faces'] = duplicate_faces
+
+    if duplicate_faces > 0:
+        issues.append({
+            'type': 'warn',
+            'title': 'Duplicate faces',
+            'desc': f'{duplicate_faces:,} duplicate triangles found.',
+            'severity': 1
+        })
+
+    # ── High polygon count (AI models are typically way too dense) ──
+    stats['is_high_poly'] = stats['triangles'] > 100000
+    if stats['is_high_poly']:
+        issues.append({
+            'type': 'warn',
+            'title': 'Excessive polygon count',
+            'desc': f"{stats['triangles']:,} triangles. AI-generated models are often 5-10× denser than needed. Slicers may be slow or crash.",
+            'severity': 2
+        })
+
+    # ── Disconnected components (floating geometry) ──
+    bodies = mesh.split(only_watertight=False)
+    stats['body_count'] = len(bodies)
+
+    if len(bodies) > 1:
+        # Find small floating pieces
+        main_body_verts = max(len(b.vertices) for b in bodies)
+        small_bodies = sum(1 for b in bodies if len(b.vertices) < main_body_verts * 0.05)
+        if small_bodies > 0:
+            issues.append({
+                'type': 'warn',
+                'title': 'Floating geometry',
+                'desc': f'{small_bodies} disconnected component(s) detected. Likely internal artifacts from AI generation.',
+                'severity': 2
+            })
+
+    # ── Thin wall detection (sample-based) ──
+    # Use ray casting to estimate wall thickness at sample points
+    try:
+        if mesh.is_watertight and len(mesh.vertices) > 100:
+            sample_count = min(500, len(mesh.faces))
+            face_indices = np.random.choice(len(mesh.faces), sample_count, replace=False)
+            thin_count = 0
+
+            for fi in face_indices[:100]:  # Check subset for speed
+                centroid = mesh.triangles_center[fi]
+                normal = mesh.face_normals[fi]
+                # Cast ray inward
+                locations, _, _ = mesh.ray.intersects_location(
+                    ray_origins=[centroid - normal * 0.001],
+                    ray_directions=[-normal]
+                )
+                if len(locations) > 0:
+                    dist = np.min(np.linalg.norm(locations - centroid, axis=1))
+                    if dist < 0.4:  # Less than 0.4mm
+                        thin_count += 1
+
+            if thin_count > 10:
+                pct = round(thin_count / 100 * 100)
+                issues.append({
+                    'type': 'warn',
+                    'title': 'Thin walls detected',
+                    'desc': f'~{pct}% of sampled faces have wall thickness below 0.4mm (minimum for FDM).',
+                    'severity': 2
+                })
+    except Exception as e:
+        logger.warning(f"Thin wall check failed: {e}")
+
+    # Sort by severity
+    issues.sort(key=lambda x: x['severity'], reverse=True)
+
+    return {'stats': stats, 'issues': issues}
+
+
+# ──────────────────────────────────────────────
+# Mesh Repair Engine
+# ──────────────────────────────────────────────
+import time
+import signal
+
+# Repair timeout constants
+REPAIR_HARD_CEILING = 360      # 6 minutes — absolute max
+REPAIR_STALL_TIMEOUT = 60      # If no progress in 60 seconds, return what we have
+
+
+class RepairTimeout(Exception):
+    """Raised when repair hits hard ceiling."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise RepairTimeout("Repair hit hard time ceiling")
+
+
+def _mesh_fingerprint(mesh):
+    """Quick hash of mesh state to detect progress."""
+    return (len(mesh.faces), len(mesh.vertices), mesh.is_watertight)
+
+
+def repair_mesh(mesh, analysis):
+    """
+    Perform real mesh repair using trimesh + pymeshfix.
+    Uses progress-based timeout: if a step makes no measurable change
+    in 60 seconds, we return what we have. Hard ceiling at 6 minutes.
+    Returns (repaired_mesh, list_of_repairs_performed).
+    """
+    repairs = []
+    t_start = time.time()
+    last_progress_time = t_start
+    last_fingerprint = _mesh_fingerprint(mesh)
+    timed_out = False
+    original_faces = len(mesh.faces)
+    original_verts = len(mesh.vertices)
+
+    # Set hard ceiling via signal alarm (Unix only, safe in Gunicorn worker)
+    old_handler = None
+    try:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(REPAIR_HARD_CEILING)
+    except (ValueError, OSError):
+        # signal.alarm not available (Windows, or not main thread)
+        old_handler = None
+
+    def _check_progress(step_name):
+        """Check if we should keep going. Returns False if we should bail."""
+        nonlocal last_progress_time, last_fingerprint, timed_out
+
+        elapsed = time.time() - t_start
+        fp = _mesh_fingerprint(mesh)
+
+        if fp != last_fingerprint:
+            # Mesh changed — we're making progress
+            last_fingerprint = fp
+            last_progress_time = time.time()
+            logger.info(f"  [{elapsed:.1f}s] {step_name}: progress (faces={fp[0]}, verts={fp[1]}, watertight={fp[2]})")
+        else:
+            stall_time = time.time() - last_progress_time
+            if stall_time > REPAIR_STALL_TIMEOUT:
+                logger.warning(f"  [{elapsed:.1f}s] {step_name}: stalled {stall_time:.0f}s — returning current state")
+                timed_out = True
+                return False
+
+        if elapsed > REPAIR_HARD_CEILING:
+            logger.warning(f"  [{elapsed:.1f}s] Hard ceiling reached at {step_name}")
+            timed_out = True
+            return False
+
+        return True
+
+    try:
+        logger.info(f"Repair started: {original_faces:,} faces, ceiling={REPAIR_HARD_CEILING}s, stall={REPAIR_STALL_TIMEOUT}s")
+
+        # ── Step 1: Remove degenerate faces ──
+        if analysis['stats']['degenerate_faces'] > 0:
+            areas = mesh.area_faces
+            valid = areas >= 1e-10
+            if np.sum(~valid) > 0:
+                mesh.update_faces(valid)
+                removed = int(np.sum(~valid))
+                repairs.append(f"Removed {removed:,} degenerate triangles")
+        if not _check_progress("degenerate removal"):
+            raise RepairTimeout("stall")
+
+        # ── Step 2: Remove duplicate faces ──
+        if analysis['stats']['duplicate_faces'] > 0:
+            face_sorted = np.sort(mesh.faces, axis=1)
+            _, unique_idx = np.unique(face_sorted, axis=0, return_index=True)
+            if len(unique_idx) < len(mesh.faces):
+                removed = len(mesh.faces) - len(unique_idx)
+                mask = np.zeros(len(mesh.faces), dtype=bool)
+                mask[unique_idx] = True
+                mesh.update_faces(mask)
+                repairs.append(f"Removed {removed:,} duplicate faces")
+        if not _check_progress("duplicate removal"):
+            raise RepairTimeout("stall")
+
+        # ── Step 3: Remove small disconnected components ──
+        if analysis['stats']['body_count'] > 1:
+            bodies = mesh.split(only_watertight=False)
+            if len(bodies) > 1:
+                main_body = max(bodies, key=lambda b: len(b.vertices))
+                removed_bodies = len(bodies) - 1
+                mesh = main_body
+                repairs.append(f"Removed {removed_bodies} floating component(s)")
+        if not _check_progress("component cleanup"):
+            raise RepairTimeout("stall")
+
+        # ── Step 4: Fix normals ──
+        try:
+            mesh.fix_normals()
+            repairs.append("Fixed face normals and winding order")
+        except Exception as e:
+            logger.warning(f"Normal fix failed: {e}")
+        if not _check_progress("normal fix"):
+            raise RepairTimeout("stall")
+
+        # ── Step 5: Fill holes with pymeshfix ──
+        try:
+            verts = mesh.vertices.copy()
+            faces = mesh.faces.copy()
+
+            meshfix = pymeshfix.MeshFix(verts, faces)
+            meshfix.repair()
+
+            repaired_verts = meshfix.v
+            repaired_faces = meshfix.f
+
+            if len(repaired_verts) > 0 and len(repaired_faces) > 0:
+                mesh = trimesh.Trimesh(
+                    vertices=repaired_verts,
+                    faces=repaired_faces,
+                    process=True
+                )
+                repairs.append("Closed holes and fixed non-manifold geometry (pymeshfix)")
+                logger.info("pymeshfix repair successful")
+            else:
+                logger.warning("pymeshfix returned empty mesh, skipping")
+        except RepairTimeout:
+            raise
+        except Exception as e:
+            logger.warning(f"pymeshfix repair failed: {e}")
+            try:
+                trimesh.repair.fill_holes(mesh)
+                repairs.append("Filled holes (trimesh fallback)")
+            except Exception as e2:
+                logger.warning(f"Trimesh hole fill also failed: {e2}")
+        if not _check_progress("hole fill"):
+            raise RepairTimeout("stall")
+
+        # ── Step 6: Fix normals again after repair ──
+        try:
+            mesh.fix_normals()
+        except:
+            pass
+
+        # ── Step 7: Decimate if high-poly ──
+        if analysis['stats']['is_high_poly'] and len(mesh.faces) > 100000:
+            target = max(50000, len(mesh.faces) // 3)
+            try:
+                decimated = mesh.simplify_quadric_decimation(target)
+                if len(decimated.faces) > 0:
+                    before = len(mesh.faces)
+                    mesh = decimated
+                    repairs.append(f"Decimated from {before:,} to {len(mesh.faces):,} triangles ({round(len(mesh.faces)/before*100)}%)")
+            except RepairTimeout:
+                raise
+            except Exception as e:
+                logger.warning(f"Decimation failed: {e}")
+        if not _check_progress("decimation"):
+            raise RepairTimeout("stall")
+
+        # ── Step 8: Merge close vertices ──
+        try:
+            mesh.merge_vertices()
+            repairs.append("Merged coincident vertices")
+        except:
+            pass
+
+        # ── Step 9: Manifold validation & polish ──
+        # Run the repaired mesh through Manifold (the engine inside PrusaSlicer/Blender).
+        # If Manifold accepts it, the mesh is guaranteed manifold and print-safe.
+        # If it rejects, we still have the pymeshfix result.
+        try:
+            m_verts = np.array(mesh.vertices, dtype=np.float64)
+            m_faces = np.array(mesh.faces, dtype=np.uint32)
+            m_mesh = manifold3d.Mesh(vert_properties=m_verts, tri_verts=m_faces)
+            m_result = manifold3d.Manifold(m_mesh)
+
+            if m_result.status() == manifold3d.Error.NoError and m_result.num_tri() > 0:
+                out = m_result.to_mesh()
+                out_verts = np.array(out.vert_properties)[:, :3]
+                out_faces = np.array(out.tri_verts)
+                manifold_mesh = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=True)
+
+                if len(manifold_mesh.faces) > 0 and manifold_mesh.is_watertight:
+                    mesh = manifold_mesh
+                    repairs.append("✓ Manifold-validated (PrusaSlicer/Blender engine)")
+                    logger.info("Manifold validation: PASSED — mesh is guaranteed clean")
+                else:
+                    logger.info("Manifold output not watertight, keeping pymeshfix result")
+            else:
+                logger.info(f"Manifold validation: REJECTED ({m_result.status()}) — keeping pymeshfix result")
+        except RepairTimeout:
+            raise
+        except Exception as e:
+            logger.warning(f"Manifold validation step failed: {e} — keeping pymeshfix result")
+        if not _check_progress("manifold validation"):
+            raise RepairTimeout("stall")
+
+    except RepairTimeout:
+        elapsed = time.time() - t_start
+        repairs.append(f"⏱ Repair timed out at {elapsed:.0f}s — returning best result so far")
+        logger.warning(f"Repair timed out at {elapsed:.1f}s after {len(repairs)} operations")
+        timed_out = True
+
+    finally:
+        # Clear the alarm
+        try:
+            signal.alarm(0)
+            if old_handler is not None:
+                signal.signal(signal.SIGALRM, old_handler)
+        except (ValueError, OSError):
+            pass
+
+    # Final stats
+    elapsed = time.time() - t_start
+    repairs.append(f"Final mesh: {len(mesh.faces):,} faces, {len(mesh.vertices):,} vertices ({elapsed:.1f}s)")
+    if mesh.is_watertight:
+        repairs.append("✓ Mesh is watertight and print-ready")
+    elif timed_out:
+        repairs.append("⚠ Partial repair — mesh improved but may need further work in your slicer")
+    else:
+        repairs.append("⚠ Mesh may still have minor issues — check in your slicer")
+
+    logger.info(f"Repair finished: {len(mesh.faces):,} faces in {elapsed:.1f}s ({len(repairs)} ops, timed_out={timed_out})")
+    return mesh, repairs
+
+
+# ──────────────────────────────────────────────
+# Repair Judge — evaluates repair quality
+# ──────────────────────────────────────────────
+def judge_repair(job_id, before_analysis, after_analysis, repairs, duration):
+    """
+    Compare before/after analysis to score repair quality.
+    Logs everything to repair_ledger for learning.
+    Returns a verdict dict.
+    """
+    before_issues = before_analysis.get('issues', [])
+    after_issues = after_analysis.get('issues', [])
+    before_stats = before_analysis.get('stats', {})
+    after_stats = after_analysis.get('stats', {})
+
+    # Count by type
+    before_errors = sum(1 for i in before_issues if i['type'] == 'error')
+    before_warns = sum(1 for i in before_issues if i['type'] == 'warn')
+    after_errors = sum(1 for i in after_issues if i['type'] == 'error')
+    after_warns = sum(1 for i in after_issues if i['type'] == 'warn')
+
+    # What got fixed
+    before_titles = set(i['title'] for i in before_issues)
+    after_titles = set(i['title'] for i in after_issues)
+    fixed = list(before_titles - after_titles)
+    remaining = list(before_titles & after_titles)
+    introduced = list(after_titles - before_titles)
+
+    # Score: 0-100
+    if before_errors + before_warns == 0:
+        score = 100  # nothing to fix
+    else:
+        fixed_ratio = len(fixed) / len(before_titles) if before_titles else 1
+        penalty = len(introduced) * 15  # new issues are bad
+        watertight_bonus = 20 if after_stats.get('is_watertight') and not before_stats.get('is_watertight') else 0
+        score = max(0, min(100, int(fixed_ratio * 80 + watertight_bonus - penalty)))
+
+    # Verdict
+    if score >= 80 and after_errors == 0:
+        grade = 'pass'
+    elif score >= 50:
+        grade = 'partial'
+    else:
+        grade = 'fail'
+
+    verdict = {
+        'job_id': job_id,
+        'score': score,
+        'grade': grade,
+        'before': {
+            'errors': before_errors,
+            'warnings': before_warns,
+            'watertight': before_stats.get('is_watertight', False),
+            'triangles': before_stats.get('triangles', 0),
+            'non_manifold': before_stats.get('non_manifold_edges', 0),
+        },
+        'after': {
+            'errors': after_errors,
+            'warnings': after_warns,
+            'watertight': after_stats.get('is_watertight', False),
+            'triangles': after_stats.get('triangles', 0),
+            'non_manifold': after_stats.get('non_manifold_edges', 0),
+        },
+        'fixed': fixed,
+        'remaining': remaining,
+        'introduced': introduced,
+        'repairs_attempted': repairs,
+        'duration_seconds': round(duration, 2),
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
+    }
+
+    # Log to ledger
+    repair_ledger.append(verdict)
+    logger.info(f"Judge: {job_id} → {grade} (score={score}, fixed={len(fixed)}, remaining={len(remaining)}, introduced={len(introduced)})")
+
+    if grade == 'fail':
+        logger.warning(f"REPAIR FAIL: {job_id} — remaining={remaining}, introduced={introduced}")
+
+    return verdict
+
+
+# ──────────────────────────────────────────────
+# Tessellation for frontend
+# ──────────────────────────────────────────────
+def mesh_to_json(mesh):
+    """Convert trimesh to JSON-serializable format for Three.js"""
+    vertices = mesh.vertices.flatten().tolist()
+    face_normals = mesh.face_normals
+    normals = np.repeat(face_normals, 3, axis=0).flatten().tolist()
+    indices = mesh.faces.flatten().tolist()
+
+    return {
+        'vertices': vertices,
+        'normals': normals,
+        'indices': indices,
+        'face_count': len(mesh.faces),
+        'vertex_count': len(mesh.vertices)
+    }
+
+
+# ──────────────────────────────────────────────
+# Printability Heatmap Engine
+# ──────────────────────────────────────────────
+def analyze_printability(mesh, build_direction='z', printer_profile=None):
+    """
+    Compute per-face printability scores.
+    Returns arrays of per-face data for heatmap rendering.
+
+    Analyzes:
+    - Overhang angle (relative to build plate)
+    - Wall thickness (ray-based estimation)
+    - Bridge detection (unsupported horizontal spans)
+    - Face size (tiny features that won't resolve)
+
+    Returns dict with per-face arrays + summary stats.
+    """
+    n_faces = len(mesh.faces)
+    logger.info(f"Printability analysis: {n_faces} faces")
+
+    # Printer defaults (FDM)
+    profile = printer_profile or {}
+    overhang_warn = profile.get('overhang_warn', 45)     # degrees past horizontal
+    overhang_fail = profile.get('overhang_fail', 60)      # degrees past horizontal
+    min_wall_mm = profile.get('min_wall', 0.4)            # mm
+    warn_wall_mm = profile.get('warn_wall', 0.8)          # mm
+    min_feature_mm2 = profile.get('min_feature', 0.1)     # mm² face area
+    nozzle_mm = profile.get('nozzle', 0.4)                # mm
+
+    # Build direction vector
+    build_vectors = {'z': np.array([0, 0, 1]), 'y': np.array([0, 1, 0]), 'x': np.array([1, 0, 0])}
+    build_dir = build_vectors.get(build_direction, build_vectors['z'])
+
+    # ═══ 1. OVERHANG ANALYSIS ═══
+    # Angle between face normal and build direction
+    # 0° = face points straight up (perfect)
+    # 90° = face is vertical (ok)
+    # 180° = face points straight down (worst overhang)
+    normals = mesh.face_normals
+    dots = np.dot(normals, build_dir)
+    face_angles = np.degrees(np.arccos(np.clip(dots, -1.0, 1.0)))
+
+    # Overhang score: 0 (no issue) to 1 (severe)
+    # Faces pointing down past the overhang threshold need support
+    # A face at 90° is vertical (no overhang). Past 90° = overhang.
+    # overhang_angle = angle_from_up - 90
+    overhang_angles = np.maximum(0, face_angles - 90)  # 0 = vertical or up, 90 = straight down
+
+    overhang_scores = np.zeros(n_faces)
+    warn_mask = overhang_angles > overhang_warn
+    fail_mask = overhang_angles > overhang_fail
+
+    # Gradual scoring
+    overhang_scores[warn_mask] = np.clip(
+        (overhang_angles[warn_mask] - overhang_warn) / (overhang_fail - overhang_warn),
+        0, 1
+    )
+    overhang_scores[fail_mask] = 1.0
+
+    # Bottom face (directly facing down) = definite overhang
+    bottom_mask = face_angles > 170  # nearly straight down
+    overhang_scores[bottom_mask] = 1.0
+
+    # ═══ 2. WALL THICKNESS ANALYSIS ═══
+    # Sample faces and cast rays inward to estimate thickness
+    thickness_scores = np.zeros(n_faces)
+    thickness_values = np.full(n_faces, -1.0)  # -1 = not measured
+
+    # Sample up to 2000 faces for ray casting (expensive operation)
+    sample_count = min(2000, n_faces)
+    sample_indices = np.random.choice(n_faces, sample_count, replace=False)
+
+    try:
+        centroids = mesh.triangles_center[sample_indices]
+        ray_normals = mesh.face_normals[sample_indices]
+
+        # Cast rays inward (opposite to face normal)
+        ray_origins = centroids - ray_normals * 0.001  # slight offset to avoid self-hit
+        ray_directions = -ray_normals
+
+        locations, index_ray, index_tri = mesh.ray.intersects_location(
+            ray_origins=ray_origins,
+            ray_directions=ray_directions
+        )
+
+        if len(locations) > 0:
+            # For each ray, find the nearest intersection
+            for i in range(sample_count):
+                hits = index_ray == i
+                if np.any(hits):
+                    hit_locs = locations[hits]
+                    dists = np.linalg.norm(hit_locs - centroids[i], axis=1)
+                    # Filter out very close hits (self-intersection artifacts)
+                    valid = dists > 0.01
+                    if np.any(valid):
+                        min_dist = np.min(dists[valid])
+                        fi = sample_indices[i]
+                        thickness_values[fi] = min_dist
+
+                        if min_dist < min_wall_mm:
+                            thickness_scores[fi] = 1.0  # Too thin — will fail
+                        elif min_dist < warn_wall_mm:
+                            thickness_scores[fi] = 0.5 + 0.5 * (1 - (min_dist - min_wall_mm) / (warn_wall_mm - min_wall_mm))
+                        else:
+                            thickness_scores[fi] = 0.0
+
+        # Propagate scores to unmeasured neighbors (simple nearest-neighbor)
+        measured_mask = thickness_values >= 0
+        if np.any(measured_mask) and not np.all(measured_mask):
+            measured_centroids = mesh.triangles_center[measured_mask]
+            measured_scores = thickness_scores[measured_mask]
+            unmeasured_indices = np.where(~measured_mask)[0]
+
+            # For unmeasured faces, use average of nearest measured faces
+            for ui in unmeasured_indices[:min(len(unmeasured_indices), 5000)]:
+                centroid = mesh.triangles_center[ui]
+                dists = np.linalg.norm(measured_centroids - centroid, axis=1)
+                nearest = np.argsort(dists)[:3]
+                thickness_scores[ui] = np.mean(measured_scores[nearest])
+
+    except Exception as e:
+        logger.warning(f"Wall thickness analysis failed: {e}")
+
+    # ═══ 3. TINY FEATURE DETECTION ═══
+    areas = mesh.area_faces
+    tiny_scores = np.zeros(n_faces)
+    tiny_mask = areas < min_feature_mm2
+    tiny_scores[tiny_mask] = 1.0
+    small_mask = (areas >= min_feature_mm2) & (areas < min_feature_mm2 * 5)
+    tiny_scores[small_mask] = 0.3
+
+    # ═══ 4. BRIDGE DETECTION ═══
+    # Faces that are nearly horizontal AND have overhangs on adjacent faces
+    bridge_scores = np.zeros(n_faces)
+    horizontal_mask = (face_angles > 80) & (face_angles < 100)  # near-horizontal faces
+    # If a horizontal face is not supported (i.e. it's not near the bottom), it's a bridge
+    face_z_min = np.min(mesh.triangles[:, :, 2], axis=1)
+    model_z_min = mesh.bounds[0][2]
+    model_z_range = mesh.bounds[1][2] - model_z_min
+
+    if model_z_range > 0:
+        relative_height = (face_z_min - model_z_min) / model_z_range
+        # Horizontal faces high up = likely bridges
+        bridge_mask = horizontal_mask & (relative_height > 0.1)
+        bridge_scores[bridge_mask] = 0.6
+
+    # ═══ COMPOSITE SCORE ═══
+    # Weighted combination
+    composite = np.clip(
+        overhang_scores * 0.45 +
+        thickness_scores * 0.30 +
+        bridge_scores * 0.15 +
+        tiny_scores * 0.10,
+        0, 1
+    )
+
+    # ═══ PER-FACE COLORS (RGB) ═══
+    # Green (safe) → Yellow (warning) → Red (fail)
+    colors = np.zeros((n_faces, 3))
+    for i in range(n_faces):
+        s = composite[i]
+        if s < 0.3:
+            # Green to yellow-green
+            t = s / 0.3
+            colors[i] = [t * 0.9, 0.85 + t * 0.15, 0.1 * (1 - t)]
+        elif s < 0.6:
+            # Yellow-green to orange
+            t = (s - 0.3) / 0.3
+            colors[i] = [0.9 + t * 0.1, 1.0 - t * 0.4, 0]
+        else:
+            # Orange to red
+            t = (s - 0.6) / 0.4
+            colors[i] = [1.0, 0.6 * (1 - t), 0]
+
+    # Per-vertex colors (3 verts per face for flat shading)
+    vertex_colors = np.repeat(colors, 3, axis=0).flatten().tolist()
+
+    # ═══ CATEGORY MASKS ═══
+    # For frontend toggles — which faces have which issue type
+    overhang_faces = (overhang_scores > 0.3).tolist()
+    thin_wall_faces = (thickness_scores > 0.3).tolist()
+    bridge_faces = (bridge_scores > 0.3).tolist()
+    tiny_faces = (tiny_scores > 0.3).tolist()
+
+    # ═══ SUMMARY STATS ═══
+    total_area = float(np.sum(areas))
+    overhang_area = float(np.sum(areas[overhang_scores > 0.3]))
+    thin_area = float(np.sum(areas[thickness_scores > 0.3]))
+
+    summary = {
+        'total_faces': n_faces,
+        'overhang_faces': int(np.sum(overhang_scores > 0.3)),
+        'severe_overhang_faces': int(np.sum(overhang_scores > 0.7)),
+        'thin_wall_faces': int(np.sum(thickness_scores > 0.3)),
+        'critical_thin_faces': int(np.sum(thickness_scores > 0.7)),
+        'bridge_faces': int(np.sum(bridge_scores > 0.3)),
+        'tiny_feature_faces': int(np.sum(tiny_scores > 0.3)),
+        'printable_pct': round(float(np.mean(composite < 0.3)) * 100, 1),
+        'warning_pct': round(float(np.mean((composite >= 0.3) & (composite < 0.6))) * 100, 1),
+        'fail_pct': round(float(np.mean(composite >= 0.6)) * 100, 1),
+        'overhang_area_pct': round(overhang_area / total_area * 100, 1) if total_area > 0 else 0,
+        'thin_area_pct': round(thin_area / total_area * 100, 1) if total_area > 0 else 0,
+        'support_needed': bool(np.any(overhang_scores > 0.5)),
+        'print_difficulty': 'Easy' if np.mean(composite) < 0.15 else ('Moderate' if np.mean(composite) < 0.35 else 'Difficult'),
+        'build_direction': build_direction
+    }
+
+    logger.info(f"Printability: {summary['printable_pct']}% clean, {summary['warning_pct']}% warn, {summary['fail_pct']}% fail")
+
+    return {
+        'vertex_colors': vertex_colors,
+        'composite_scores': composite.tolist(),
+        'overhang_scores': overhang_scores.tolist(),
+        'thickness_scores': thickness_scores.tolist(),
+        'summary': summary,
+        'category_masks': {
+            'overhangs': overhang_faces,
+            'thin_walls': thin_wall_faces,
+            'bridges': bridge_faces,
+            'tiny_features': tiny_faces
+        }
+    }
+
+
+# ──────────────────────────────────────────────
+# Auto-Orient Engine
+# ──────────────────────────────────────────────
+def _rotation_matrix(axis, angle_deg):
+    """Create a 4x4 rotation matrix for a given axis and angle."""
+    angle = np.radians(angle_deg)
+    c, s = np.cos(angle), np.sin(angle)
+    if axis == 'x':
+        return np.array([[1,0,0,0],[0,c,-s,0],[0,s,c,0],[0,0,0,1]])
+    elif axis == 'y':
+        return np.array([[c,0,s,0],[0,1,0,0],[-s,0,c,0],[0,0,0,1]])
+    else:  # z
+        return np.array([[c,-s,0,0],[s,c,0,0],[0,0,1,0],[0,0,0,1]])
+
+
+def _score_orientation(mesh, label, rotation_matrix=None):
+    """
+    Rotate mesh, run printability analysis, and compute a composite score.
+    Lower score = better orientation for printing.
+    Returns dict with scores, summary, and rotation info.
+    """
+    test_mesh = mesh.copy()
+    if rotation_matrix is not None:
+        test_mesh.apply_transform(rotation_matrix)
+
+    # Run lightweight printability (skip wall thickness for speed — just overhangs + bridges)
+    n_faces = len(test_mesh.faces)
+    build_dir = np.array([0, 0, 1])
+    normals = test_mesh.face_normals
+    dots = np.dot(normals, build_dir)
+    face_angles = np.degrees(np.arccos(np.clip(dots, -1.0, 1.0)))
+
+    # Overhang scoring
+    overhang_angles = np.maximum(0, face_angles - 90)
+    overhang_scores = np.zeros(n_faces)
+    overhang_scores[overhang_angles > 45] = np.clip((overhang_angles[overhang_angles > 45] - 45) / 15, 0, 1)
+    overhang_scores[face_angles > 170] = 1.0
+
+    # Bridge scoring
+    bridge_scores = np.zeros(n_faces)
+    horizontal_mask = (face_angles > 80) & (face_angles < 100)
+    face_z_min = np.min(test_mesh.triangles[:, :, 2], axis=1)
+    model_z_min = test_mesh.bounds[0][2]
+    z_range = test_mesh.bounds[1][2] - model_z_min
+    if z_range > 0:
+        rel_height = (face_z_min - model_z_min) / z_range
+        bridge_scores[horizontal_mask & (rel_height > 0.1)] = 0.6
+
+    # Composite per-face
+    composite = overhang_scores * 0.7 + bridge_scores * 0.3
+    areas = test_mesh.area_faces
+    total_area = float(np.sum(areas))
+
+    # Weighted scores (area-weighted so big problem faces matter more)
+    overhang_area = float(np.sum(areas[overhang_scores > 0.3]))
+    overhang_area_pct = round(overhang_area / total_area * 100, 1) if total_area > 0 else 0
+    support_faces = int(np.sum(overhang_scores > 0.3))
+    fail_pct = round(float(np.mean(composite >= 0.6)) * 100, 1)
+    safe_pct = round(float(np.mean(composite < 0.3)) * 100, 1)
+
+    # Z-height (affects print time)
+    z_height = float(test_mesh.bounds[1][2] - test_mesh.bounds[0][2])
+
+    # Build plate contact area (faces on the very bottom — good for adhesion)
+    bottom_z = test_mesh.bounds[0][2]
+    bottom_faces = np.sum(np.min(test_mesh.triangles[:, :, 2], axis=1) < (bottom_z + 0.5))
+    contact_score = float(bottom_faces) / n_faces  # Higher = more bed contact
+
+    # Composite orientation score (lower = better)
+    # Heavily weight overhang area, moderately weight z-height and contact
+    orientation_score = (
+        overhang_area_pct * 0.50 +     # Minimize support material
+        fail_pct * 0.25 +               # Minimize failures
+        (z_height / max(z_range, 1)) * 10 * 0.15 +  # Prefer shorter prints
+        (1 - contact_score) * 10 * 0.10              # Prefer good bed adhesion
+    )
+
+    return {
+        'label': label,
+        'orientation_score': round(orientation_score, 2),
+        'overhang_area_pct': overhang_area_pct,
+        'support_faces': support_faces,
+        'fail_pct': fail_pct,
+        'safe_pct': safe_pct,
+        'z_height_mm': round(z_height, 1),
+        'contact_score': round(contact_score * 100, 1),
+        'rotation_matrix': rotation_matrix.tolist() if rotation_matrix is not None else None
+    }
+
+
+def auto_orient(mesh):
+    """
+    Test multiple orientations and return the top 3 ranked by printability.
+    Each result includes the rotation matrix to apply and a plain-language summary.
+    """
+    t0 = time.time()
+    logger.info(f"Auto-orient: testing orientations on {len(mesh.faces):,} face mesh")
+
+    # Define candidate orientations
+    candidates = [
+        ("Original", None),
+        ("Face down (X+90°)", _rotation_matrix('x', 90)),
+        ("Face up (X-90°)", _rotation_matrix('x', -90)),
+        ("On side (Y+90°)", _rotation_matrix('y', 90)),
+        ("On side (Y-90°)", _rotation_matrix('y', -90)),
+        ("Flipped (X+180°)", _rotation_matrix('x', 180)),
+        # Diagonal orientations — often optimal for organic shapes
+        ("Tilted 45° (X+45°)", _rotation_matrix('x', 45)),
+        ("Tilted 45° (X-45°)", _rotation_matrix('x', -45)),
+        ("Tilted 30° (X+30°)", _rotation_matrix('x', 30)),
+        ("Tilted Y 45° (Y+45°)", _rotation_matrix('y', 45)),
+    ]
+
+    results = []
+    for label, rot in candidates:
+        try:
+            result = _score_orientation(mesh, label, rot)
+            results.append(result)
+        except Exception as e:
+            logger.warning(f"Orientation '{label}' failed: {e}")
+
+    # Sort by score (lower = better)
+    results.sort(key=lambda r: r['orientation_score'])
+
+    # Tag the top results with strategy labels
+    if len(results) >= 1:
+        best = results[0]
+        # Find the one with lowest z-height
+        fastest = min(results, key=lambda r: r['z_height_mm'])
+        # Find the one with best surface quality (highest safe_pct)
+        smoothest = max(results, key=lambda r: r['safe_pct'])
+
+        for r in results:
+            r['tags'] = []
+            if r['label'] == best['label']:
+                r['tags'].append('recommended')
+            if r['label'] == fastest['label']:
+                r['tags'].append('fastest')
+            if r['label'] == smoothest['label']:
+                r['tags'].append('best_surface')
+            if r['overhang_area_pct'] == min(x['overhang_area_pct'] for x in results):
+                r['tags'].append('least_supports')
+
+        # Generate plain-language recommendation for top 3
+        for r in results[:3]:
+            parts = []
+            parts.append(f"{r['overhang_area_pct']}% overhang area")
+            if r['support_faces'] > 0:
+                parts.append(f"supports needed")
+            else:
+                parts.append("no supports")
+            parts.append(f"{r['z_height_mm']}mm tall")
+            r['description'] = " · ".join(parts)
+
+    elapsed = time.time() - t0
+    logger.info(f"Auto-orient complete: {len(results)} orientations tested in {elapsed:.1f}s")
+
+    return {
+        'orientations': results[:3],  # Top 3 only
+        'all_tested': len(results),
+        'elapsed_seconds': round(elapsed, 2)
+    }
+
+
+# ──────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/app')
+def workspace():
+    return render_template('workspace.html')
+
+
+@app.route('/api/job/<job_id>')
+def get_job(job_id):
+    """Return job data for a previously uploaded file."""
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    job = jobs[job_id]
+
+    # Load mesh data
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+    mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+    mesh_data = mesh_to_json(mesh)
+
+    return jsonify({
+        'job_id': job_id,
+        'original_name': job.get('original_name', 'model.stl'),
+        'file_size': job.get('file_size', 0),
+        'analysis': job['analysis'],
+        'mesh_data': mesh_data,
+        'repaired': job['repaired']
+    })
+
+
+@app.route('/api/upload', methods=['POST'])
+def upload():
+    """Upload STL file, return analysis results + mesh data for preview."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['file']
+    if not file.filename.lower().endswith('.stl'):
+        return jsonify({'error': 'Only STL files are supported'}), 400
+
+    # Generate job ID
+    job_id = str(uuid.uuid4())[:12]
+    filename = f"{job_id}.stl"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    file_size = os.path.getsize(filepath)
+    logger.info(f"Upload: {file.filename} ({file_size/1024/1024:.2f}MB) → {job_id}")
+
+    try:
+        # Load mesh
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+
+        if mesh is None or len(mesh.faces) == 0:
+            return jsonify({'error': 'Failed to parse STL file — no geometry found'}), 400
+
+        # Analyze
+        analysis = analyze_mesh(mesh)
+
+        # Generate mesh data for frontend preview
+        mesh_data = mesh_to_json(mesh)
+
+        # Store job
+        jobs[job_id] = {
+            'original_path': filepath,
+            'original_filename': file.filename,
+            'file_size': file_size,
+            'analysis': analysis,
+            'repaired': False,
+            'repaired_path': None,
+            'created_at': datetime.utcnow().isoformat(),
+            'paid': False
+        }
+
+        return jsonify({
+            'job_id': job_id,
+            'filename': file.filename,
+            'file_size': file_size,
+            'analysis': analysis,
+            'mesh_data': mesh_data
+        })
+
+    except Exception as e:
+        logger.error(f"Upload processing failed: {e}")
+        return jsonify({'error': f'Failed to process STL: {str(e)}'}), 500
+
+
+@app.route('/api/repair/<job_id>', methods=['POST'])
+def repair(job_id):
+    """Run real mesh repair on uploaded file. Requires Maker+ subscription."""
+    # ── Auth + Usage Check ──
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Login required to repair files', 'auth_required': True}), 401
+
+    user_tier = user.get('tier', 'free')
+    if user_tier == 'free':
+        return jsonify({
+            'error': 'Maker plan required to repair and download files',
+            'upgrade_required': True,
+            'current_tier': 'free'
+        }), 403
+
+    used, limit = get_user_usage(user)
+    if used >= limit:
+        return jsonify({
+            'error': f'Monthly repair limit reached ({used}/{limit}). Upgrade to Pro for unlimited.',
+            'limit_reached': True,
+            'used': used,
+            'limit': limit,
+            'current_tier': user_tier
+        }), 429
+
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+
+    if job['repaired']:
+        # Already repaired — return cached result
+        mesh = trimesh.load(job['repaired_path'], file_type='stl', force='mesh')
+        mesh_data = mesh_to_json(mesh)
+        reanalysis = analyze_mesh(mesh)
+        return jsonify({
+            'job_id': job_id,
+            'repairs': job.get('repairs', []),
+            'mesh_data': mesh_data,
+            'analysis': reanalysis
+        })
+
+    try:
+        # Load original
+        mesh = trimesh.load(job['original_path'], file_type='stl', force='mesh')
+        analysis = job['analysis']
+
+        logger.info(f"Repairing {job_id}: {len(mesh.faces)} faces, {len(analysis['issues'])} issues")
+
+        # Run repair
+        repair_start = time.time()
+        repaired_mesh, repairs = repair_mesh(mesh, analysis)
+        repair_duration = time.time() - repair_start
+
+        # Save repaired file
+        repaired_filename = f"{job_id}_repaired.stl"
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
+        repaired_mesh.export(repaired_path, file_type='stl')
+
+        # Re-analyze repaired mesh
+        reanalysis = analyze_mesh(repaired_mesh)
+
+        # Generate mesh data for frontend
+        mesh_data = mesh_to_json(repaired_mesh)
+
+        # Judge the repair
+        verdict = judge_repair(job_id, analysis, reanalysis, repairs, repair_duration)
+
+        # Update job
+        job['repaired'] = True
+        job['repaired_path'] = repaired_path
+        job['repairs'] = repairs
+        job['repaired_analysis'] = reanalysis
+        job['verdict'] = verdict
+
+        # Track usage
+        increment_usage(user)
+        used, limit = get_user_usage(user)
+
+        logger.info(f"Repair complete: {job_id} — {len(repairs)} operations, grade={verdict['grade']} ({user['email']}: {used}/{limit})")
+
+        return jsonify({
+            'job_id': job_id,
+            'repairs': repairs,
+            'mesh_data': mesh_data,
+            'analysis': reanalysis,
+            'verdict': verdict,
+            'usage': {'used': used, 'limit': limit}
+        })
+
+    except Exception as e:
+        logger.error(f"Repair failed for {job_id}: {e}")
+        return jsonify({'error': f'Repair failed: {str(e)}'}), 500
+
+
+@app.route('/api/stats')
+def api_stats():
+    """Simple stats endpoint."""
+    total_jobs = len(jobs)
+    repaired_jobs = sum(1 for j in jobs.values() if j['repaired'])
+
+    # Repair quality summary
+    grades = {'pass': 0, 'partial': 0, 'fail': 0}
+    for v in repair_ledger:
+        grades[v['grade']] = grades.get(v['grade'], 0) + 1
+
+    return jsonify({
+        'total_uploads': total_jobs,
+        'total_repairs': repaired_jobs,
+        'total_users': len(users),
+        'repair_quality': grades,
+        'total_print_failures': len(print_failures),
+        'uptime': 'ok'
+    })
+
+
+@app.route('/api/report-failure/<job_id>', methods=['POST'])
+def report_failure(job_id):
+    """
+    User reports that a repaired file didn't print correctly.
+    Captures the failure for learning. This is gold — real test cases
+    for when we upgrade the repair engine.
+    """
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    body = request.get_json(silent=True) or {}
+
+    failure = {
+        'job_id': job_id,
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'original_name': job.get('original_name', 'unknown'),
+        'original_path': job.get('original_path'),
+        'repaired_path': job.get('repaired_path'),
+        'before_analysis': job.get('analysis'),
+        'after_analysis': job.get('repaired_analysis'),
+        'verdict': job.get('verdict'),
+        'user_report': {
+            'what_happened': body.get('what_happened', ''),
+            'printer': body.get('printer', ''),
+            'slicer': body.get('slicer', ''),
+            'category': body.get('category', 'unknown'),
+            # categories: spaghetti, layer_shift, supports_failed,
+            #             surface_artifacts, incomplete, other
+        },
+        'user_email': session.get('user_email', 'anonymous'),
+        'file_size': job.get('file_size', 0),
+    }
+
+    print_failures.append(failure)
+    logger.warning(f"PRINT FAILURE REPORTED: {job_id} — {failure['user_report']['category']} by {failure['user_email']}")
+
+    return jsonify({
+        'status': 'received',
+        'message': "Thanks — this helps us improve. We'll use this to make repairs better.",
+        'failure_id': len(print_failures)
+    })
+
+
+@app.route('/api/admin/ledger')
+def admin_ledger():
+    """
+    View all repair verdicts. In production, protect with admin auth.
+    Shows what's working and what isn't.
+    """
+    admin_key = request.args.get('key', '')
+    expected_key = os.environ.get('ADMIN_KEY', 'sliceready-admin')
+    if admin_key != expected_key:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    # Summary stats
+    total = len(repair_ledger)
+    grades = {'pass': 0, 'partial': 0, 'fail': 0}
+    common_remaining = {}
+    common_introduced = {}
+    avg_score = 0
+
+    for v in repair_ledger:
+        grades[v['grade']] = grades.get(v['grade'], 0) + 1
+        avg_score += v['score']
+        for issue in v.get('remaining', []):
+            common_remaining[issue] = common_remaining.get(issue, 0) + 1
+        for issue in v.get('introduced', []):
+            common_introduced[issue] = common_introduced.get(issue, 0) + 1
+
+    return jsonify({
+        'summary': {
+            'total_repairs': total,
+            'grades': grades,
+            'avg_score': round(avg_score / total, 1) if total else 0,
+            'pass_rate': round(grades['pass'] / total * 100, 1) if total else 0,
+        },
+        'common_remaining_issues': dict(sorted(common_remaining.items(), key=lambda x: -x[1])),
+        'common_introduced_issues': dict(sorted(common_introduced.items(), key=lambda x: -x[1])),
+        'print_failures': len(print_failures),
+        'failure_categories': _count_categories(print_failures),
+        'recent_fails': [v for v in repair_ledger if v['grade'] == 'fail'][-20:],
+        'recent_print_failures': print_failures[-20:],
+    })
+
+
+@app.route('/api/admin/failures')
+def admin_failures():
+    """Full failure details for diagnosis."""
+    admin_key = request.args.get('key', '')
+    expected_key = os.environ.get('ADMIN_KEY', 'sliceready-admin')
+    if admin_key != expected_key:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    return jsonify({
+        'total': len(print_failures),
+        'failures': print_failures,
+        'categories': _count_categories(print_failures)
+    })
+
+
+def _count_categories(failures):
+    cats = {}
+    for f in failures:
+        cat = f.get('user_report', {}).get('category', 'unknown')
+        cats[cat] = cats.get(cat, 0) + 1
+    return cats
+
+
+@app.route('/api/printability/<job_id>', methods=['POST'])
+def printability(job_id):
+    """
+    Run printability heatmap analysis.
+    Optionally accepts build_direction and printer_profile in JSON body.
+    Returns per-face color data for heatmap rendering.
+    """
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    body = request.get_json(silent=True) or {}
+    build_direction = body.get('build_direction', 'z')
+    printer_profile = body.get('printer_profile', None)
+
+    # Use repaired mesh if available, otherwise original
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+
+    try:
+        mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+        result = analyze_printability(mesh, build_direction, printer_profile)
+
+        return jsonify({
+            'job_id': job_id,
+            'printability': result['summary'],
+            'vertex_colors': result['vertex_colors'],
+            'composite_scores': result['composite_scores'],
+            'category_masks': result['category_masks']
+        })
+
+    except Exception as e:
+        logger.error(f"Printability analysis failed for {job_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/orient/<job_id>', methods=['POST'])
+def orient(job_id):
+    """
+    Run auto-orient analysis. Tests 10 orientations and returns top 3
+    with scores, rotation matrices, and plain-language descriptions.
+    """
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+
+    try:
+        mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+        result = auto_orient(mesh)
+
+        return jsonify({
+            'job_id': job_id,
+            'orient': result
+        })
+
+    except Exception as e:
+        logger.error(f"Auto-orient failed for {job_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/orient-heatmap/<job_id>', methods=['POST'])
+def orient_heatmap(job_id):
+    """
+    Run full printability heatmap on a specific orientation.
+    Accepts rotation_matrix in JSON body.
+    Returns vertex colors + mesh data for the rotated model.
+    """
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    body = request.get_json(silent=True) or {}
+    rotation_matrix = body.get('rotation_matrix')
+
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+
+    try:
+        mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+
+        # Apply rotation if provided
+        if rotation_matrix is not None:
+            mat = np.array(rotation_matrix)
+            mesh.apply_transform(mat)
+
+        # Full printability analysis
+        result = analyze_printability(mesh, 'z')
+
+        # Mesh data for the rotated geometry
+        mesh_data = mesh_to_json(mesh)
+
+        return jsonify({
+            'job_id': job_id,
+            'printability': result['summary'],
+            'vertex_colors': result['vertex_colors'],
+            'composite_scores': result['composite_scores'],
+            'category_masks': result['category_masks'],
+            'mesh_data': mesh_data
+        })
+
+    except Exception as e:
+        logger.error(f"Orient-heatmap failed for {job_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ──────────────────────────────────────────────
+# Cleanup (in production, run as cron)
+# ──────────────────────────────────────────────
+def cleanup_old_files(max_age_hours=6):
+    """Remove files older than max_age_hours."""
+    cutoff = datetime.utcnow() - timedelta(hours=max_age_hours)
+    to_remove = []
+    for job_id, job in jobs.items():
+        created = datetime.fromisoformat(job['created_at'])
+        if created < cutoff:
+            for path in [job.get('original_path'), job.get('repaired_path')]:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            to_remove.append(job_id)
+    for jid in to_remove:
+        del jobs[jid]
+    if to_remove:
+        logger.info(f"Cleaned up {len(to_remove)} old jobs")
+
+
+# ══════════════════════════════════════════════
+# FEATURE 1: BATCH PROCESSING
+# ══════════════════════════════════════════════
+import zipfile
+import io
+import threading
+
+# Batch job storage
+batches = {}  # batch_id -> batch metadata
+
+
+@app.route('/batch')
+def batch_page():
+    """Serve the batch processing page."""
+    return render_template('batch.html')
+
+
+@app.route('/api/batch/upload', methods=['POST'])
+def batch_upload():
+    """
+    Upload multiple STL files for batch processing.
+    Returns a batch_id and per-file analysis results.
+    """
+    if 'files' not in request.files:
+        return jsonify({'error': 'No files provided'}), 400
+
+    files = request.files.getlist('files')
+    if not files or len(files) == 0:
+        return jsonify({'error': 'No files selected'}), 400
+
+    if len(files) > 100:
+        return jsonify({'error': 'Maximum 100 files per batch'}), 400
+
+    batch_id = str(uuid.uuid4())[:11]
+    batch_jobs = []
+
+    for f in files:
+        if not f.filename:
+            continue
+        if not f.filename.lower().endswith('.stl'):
+            batch_jobs.append({
+                'filename': f.filename,
+                'status': 'error',
+                'error': 'Not an STL file',
+                'job_id': None
+            })
+            continue
+
+        try:
+            # Save file
+            job_id = str(uuid.uuid4())[:11]
+            filename = f"{job_id}_{f.filename}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            f.save(filepath)
+
+            # Analyze
+            mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+            analysis = analyze_mesh(mesh)
+            mesh_data = mesh_to_json(mesh)
+
+            # Quick printability summary (lightweight — skip wall thickness)
+            n_faces = len(mesh.faces)
+            build_dir = np.array([0, 0, 1])
+            dots = np.dot(mesh.face_normals, build_dir)
+            face_angles = np.degrees(np.arccos(np.clip(dots, -1.0, 1.0)))
+            overhang_angles = np.maximum(0, face_angles - 90)
+            overhang_pct = round(float(np.mean(overhang_angles > 45)) * 100, 1)
+
+            # Store job
+            jobs[job_id] = {
+                'original_path': filepath,
+                'original_name': f.filename,
+                'analysis': analysis,
+                'repaired': False,
+                'repaired_path': None,
+                'created_at': datetime.utcnow().isoformat(),
+                'batch_id': batch_id
+            }
+
+            has_issues = len(analysis['issues']) > 0
+            batch_jobs.append({
+                'filename': f.filename,
+                'job_id': job_id,
+                'status': 'analyzed',
+                'triangles': analysis['stats']['triangles'],
+                'issues': len(analysis['issues']),
+                'watertight': analysis['stats']['is_watertight'],
+                'overhang_pct': overhang_pct,
+                'has_issues': has_issues,
+                'issue_list': analysis['issues']
+            })
+
+        except Exception as e:
+            logger.error(f"Batch upload failed for {f.filename}: {e}")
+            batch_jobs.append({
+                'filename': f.filename,
+                'status': 'error',
+                'error': str(e),
+                'job_id': None
+            })
+
+    # Store batch
+    batches[batch_id] = {
+        'id': batch_id,
+        'created_at': datetime.utcnow().isoformat(),
+        'jobs': batch_jobs,
+        'total': len(batch_jobs),
+        'analyzed': sum(1 for j in batch_jobs if j['status'] == 'analyzed'),
+        'errors': sum(1 for j in batch_jobs if j['status'] == 'error'),
+        'repaired': 0,
+        'status': 'analyzed'
+    }
+
+    return jsonify({
+        'batch_id': batch_id,
+        'batch': batches[batch_id]
+    })
+
+
+@app.route('/api/batch/status/<batch_id>')
+def batch_status(batch_id):
+    """Get current status of a batch job."""
+    if batch_id not in batches:
+        return jsonify({'error': 'Batch not found'}), 404
+    return jsonify({'batch': batches[batch_id]})
+
+
+@app.route('/api/batch/repair/<batch_id>', methods=['POST'])
+def batch_repair(batch_id):
+    """
+    Repair all files in a batch. Each file counts toward monthly usage.
+    Requires Maker+ subscription.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Login required', 'auth_required': True}), 401
+    if user.get('tier', 'free') == 'free':
+        return jsonify({'error': 'Maker plan required', 'upgrade_required': True}), 403
+
+    if batch_id not in batches:
+        return jsonify({'error': 'Batch not found'}), 404
+
+    batch = batches[batch_id]
+
+    # Check how many files need repair vs remaining quota
+    needs_repair = sum(1 for bj in batch['jobs'] if bj['status'] == 'analyzed' and bj.get('has_issues'))
+    used, limit = get_user_usage(user)
+    remaining = limit - used
+
+    if needs_repair > remaining:
+        return jsonify({
+            'error': f'Batch needs {needs_repair} repairs but you have {remaining} remaining this month ({used}/{limit} used)',
+            'limit_reached': True,
+            'needed': needs_repair,
+            'remaining': remaining,
+            'used': used,
+            'limit': limit
+        }), 429
+
+    batch['status'] = 'repairing'
+    repaired_count = 0
+
+    for bj in batch['jobs']:
+        if bj['status'] != 'analyzed' or not bj.get('job_id'):
+            continue
+
+        job_id = bj['job_id']
+        if job_id not in jobs:
+            bj['status'] = 'error'
+            bj['error'] = 'Job expired'
+            continue
+
+        job = jobs[job_id]
+        if job['repaired']:
+            bj['status'] = 'repaired'
+            repaired_count += 1
+            continue
+
+        try:
+            mesh = trimesh.load(job['original_path'], file_type='stl', force='mesh')
+            analysis = job['analysis']
+
+            repaired_mesh, repairs = repair_mesh(mesh, analysis)
+
+            # Save repaired
+            repaired_filename = f"{job_id}_repaired.stl"
+            repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
+            repaired_mesh.export(repaired_path, file_type='stl')
+
+            reanalysis = analyze_mesh(repaired_mesh)
+
+            job['repaired'] = True
+            job['repaired_path'] = repaired_path
+            job['repairs'] = repairs
+            job['repaired_analysis'] = reanalysis
+
+            bj['status'] = 'repaired'
+            bj['repairs'] = len(repairs)
+            bj['repaired_triangles'] = reanalysis['stats']['triangles']
+            bj['repaired_watertight'] = reanalysis['stats']['is_watertight']
+            repaired_count += 1
+            increment_usage(user)
+
+        except Exception as e:
+            logger.error(f"Batch repair failed for {job_id}: {e}")
+            bj['status'] = 'repair_failed'
+            bj['error'] = str(e)
+
+    batch['repaired'] = repaired_count
+    batch['status'] = 'complete'
+
+    return jsonify({'batch': batch})
+
+
+@app.route('/api/batch/download/<batch_id>')
+def batch_download(batch_id):
+    """Download all repaired files as a ZIP. Requires Maker+."""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Login required', 'auth_required': True}), 401
+    if user.get('tier', 'free') == 'free':
+        return jsonify({'error': 'Maker plan required', 'upgrade_required': True}), 403
+
+    if batch_id not in batches:
+        return jsonify({'error': 'Batch not found'}), 404
+
+    batch = batches[batch_id]
+    output_format = request.args.get('format', 'stl').lower()
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for bj in batch['jobs']:
+            if not bj.get('job_id') or bj['job_id'] not in jobs:
+                continue
+
+            job = jobs[bj['job_id']]
+            mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+
+            if not mesh_path or not os.path.exists(mesh_path):
+                continue
+
+            # Base filename without extension
+            base_name = os.path.splitext(bj['filename'])[0]
+
+            if output_format == '3mf':
+                try:
+                    mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+                    data_3mf = mesh.export(file_type='3mf')
+                    zf.writestr(f"{base_name}.3mf", data_3mf)
+                except Exception as e:
+                    logger.warning(f"3MF export failed for {bj['filename']}: {e}")
+                    with open(mesh_path, 'rb') as mf:
+                        zf.writestr(f"{base_name}.stl", mf.read())
+            else:
+                with open(mesh_path, 'rb') as mf:
+                    zf.writestr(f"{base_name}_repaired.stl", mf.read())
+
+    zip_buffer.seek(0)
+
+    ext = '3mf' if output_format == '3mf' else 'stl'
+    return send_file(
+        zip_buffer,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'sliceready_batch_{batch_id}.zip'
+    )
+
+
+# ══════════════════════════════════════════════
+# FEATURE 2: NON-DESTRUCTIVE TARGETED REPAIR
+# ══════════════════════════════════════════════
+
+@app.route('/api/repair-region/<job_id>', methods=['POST'])
+def repair_region(job_id):
+    """
+    Repair only a specific region of the mesh identified by face indices.
+    Non-destructive: only modifies faces in the selected region + immediate neighbors.
+    Requires Maker+ subscription.
+    """
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Login required', 'auth_required': True}), 401
+    if user.get('tier', 'free') == 'free':
+        return jsonify({'error': 'Maker plan required for targeted repair', 'upgrade_required': True}), 403
+    used, limit = get_user_usage(user)
+    if used >= limit:
+        return jsonify({'error': f'Monthly limit reached ({used}/{limit})', 'limit_reached': True}), 429
+
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    body = request.get_json(silent=True) or {}
+    face_indices = body.get('face_indices', [])
+    repair_type = body.get('repair_type', 'auto')
+    smooth_iters = body.get('smooth_iterations', 3)
+
+    if not face_indices:
+        return jsonify({'error': 'No faces selected'}), 400
+
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+
+    try:
+        mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+        face_indices = [i for i in face_indices if 0 <= i < len(mesh.faces)]
+
+        if not face_indices:
+            return jsonify({'error': 'No valid face indices'}), 400
+
+        repairs = []
+        n_selected = len(face_indices)
+
+        # Get vertices involved in selected faces
+        selected_faces = mesh.faces[face_indices]
+        selected_verts = set(selected_faces.flatten())
+
+        # Find neighbor faces (faces sharing vertices with selected region)
+        neighbor_indices = set()
+        for vi in selected_verts:
+            face_mask = np.any(mesh.faces == vi, axis=1)
+            neighbor_indices.update(np.where(face_mask)[0])
+        neighbor_indices = list(neighbor_indices)
+
+        if repair_type == 'remove':
+            # Remove selected faces entirely
+            keep_mask = np.ones(len(mesh.faces), dtype=bool)
+            keep_mask[face_indices] = False
+            mesh.update_faces(keep_mask)
+            repairs.append(f"Removed {n_selected} selected faces")
+
+            # Try to fill the hole left behind
+            try:
+                trimesh.repair.fill_holes(mesh)
+                repairs.append("Filled hole left by removed faces")
+            except:
+                pass
+
+        elif repair_type == 'fix_normals':
+            # Fix normals only for selected region
+            # Recompute normals for selected faces to match majority direction
+            centroids = mesh.triangles_center[face_indices]
+            mesh_center = mesh.centroid
+            for fi in face_indices:
+                face_centroid = mesh.triangles_center[fi]
+                outward = face_centroid - mesh_center
+                if np.dot(mesh.face_normals[fi], outward) < 0:
+                    # Flip this face
+                    mesh.faces[fi] = mesh.faces[fi][::-1]
+            mesh.face_normals[face_indices] = -mesh.face_normals[face_indices]
+            repairs.append(f"Fixed normals for {n_selected} faces")
+
+        elif repair_type == 'smooth':
+            # Laplacian smoothing only on vertices in the selected region
+            verts = mesh.vertices.copy()
+            region_verts = list(selected_verts)
+
+            for _ in range(smooth_iters):
+                new_verts = verts.copy()
+                for vi in region_verts:
+                    # Find connected vertices
+                    connected_faces = mesh.faces[np.any(mesh.faces == vi, axis=1)]
+                    connected_verts = set(connected_faces.flatten()) - {vi}
+                    if connected_verts:
+                        neighbor_positions = verts[list(connected_verts)]
+                        # Blend: 50% original, 50% average of neighbors
+                        new_verts[vi] = 0.5 * verts[vi] + 0.5 * np.mean(neighbor_positions, axis=0)
+                verts = new_verts
+
+            mesh.vertices = verts
+            repairs.append(f"Smoothed {len(region_verts)} vertices ({smooth_iters} iterations)")
+
+        elif repair_type == 'fill_holes' or repair_type == 'auto':
+            # Auto: fix normals + smooth + try to fill holes in region
+            # Step 1: Fix normals in region
+            centroids = mesh.triangles_center[face_indices]
+            mesh_center = mesh.centroid
+            flipped = 0
+            for fi in face_indices:
+                outward = mesh.triangles_center[fi] - mesh_center
+                if np.dot(mesh.face_normals[fi], outward) < 0:
+                    mesh.faces[fi] = mesh.faces[fi][::-1]
+                    flipped += 1
+            if flipped:
+                repairs.append(f"Fixed {flipped} inverted normals in region")
+
+            # Step 2: Light smoothing on severe problem areas
+            verts = mesh.vertices.copy()
+            region_verts = list(selected_verts)
+            new_verts = verts.copy()
+            for vi in region_verts:
+                connected_faces = mesh.faces[np.any(mesh.faces == vi, axis=1)]
+                connected_verts_set = set(connected_faces.flatten()) - {vi}
+                if connected_verts_set:
+                    neighbor_positions = verts[list(connected_verts_set)]
+                    new_verts[vi] = 0.7 * verts[vi] + 0.3 * np.mean(neighbor_positions, axis=0)
+            mesh.vertices = new_verts
+            repairs.append(f"Smoothed {len(region_verts)} vertices in region")
+
+            # Step 3: Try hole fill on the whole mesh (trimesh handles finding holes)
+            try:
+                trimesh.repair.fill_holes(mesh)
+                repairs.append("Filled any holes in mesh")
+            except:
+                pass
+
+        # Save result
+        repaired_filename = f"{job_id}_repaired.stl"
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
+        mesh.export(repaired_path, file_type='stl')
+
+        reanalysis = analyze_mesh(mesh)
+        mesh_data = mesh_to_json(mesh)
+
+        job['repaired'] = True
+        job['repaired_path'] = repaired_path
+        job['repairs'] = repairs
+        job['repaired_analysis'] = reanalysis
+
+        increment_usage(user)
+
+        return jsonify({
+            'job_id': job_id,
+            'repairs': repairs,
+            'faces_modified': n_selected,
+            'neighbors_affected': len(neighbor_indices),
+            'mesh_data': mesh_data,
+            'analysis': reanalysis
+        })
+
+    except Exception as e:
+        logger.error(f"Targeted repair failed for {job_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ══════════════════════════════════════════════
+# FEATURE 3: REST API (v1)
+# ══════════════════════════════════════════════
+
+def check_api_key():
+    """Validate API key from header or query param."""
+    api_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+    valid_keys = os.environ.get('SLICEREADY_API_KEYS', '').split(',')
+    # In demo mode (no keys configured), allow all requests
+    if not valid_keys or valid_keys == ['']:
+        return True, None
+    if api_key and api_key in valid_keys:
+        return True, None
+    return False, jsonify({'error': 'Invalid or missing API key', 'docs': '/api/v1/docs'}), 401
+
+
+@app.route('/api/v1/docs')
+def api_docs():
+    """Return API documentation as JSON."""
+    return jsonify({
+        'name': 'SliceReady API v1',
+        'version': '1.0',
+        'base_url': '/api/v1',
+        'auth': 'X-API-Key header or api_key query parameter',
+        'endpoints': {
+            'POST /api/v1/analyze': {
+                'description': 'Upload an STL and get mesh analysis + printability report',
+                'params': 'multipart/form-data with "file" field',
+                'returns': 'JSON with analysis, printability scores, and issue list'
+            },
+            'POST /api/v1/repair': {
+                'description': 'Upload an STL, repair it, and download the fixed file',
+                'params': 'multipart/form-data with "file" field. Optional query: format=stl|3mf',
+                'returns': 'Repaired file (STL or 3MF binary)'
+            },
+            'POST /api/v1/analyze-and-repair': {
+                'description': 'Upload, analyze, repair, and return both the report and download URL',
+                'params': 'multipart/form-data with "file" field',
+                'returns': 'JSON with analysis, repairs performed, and download_url'
+            },
+            'POST /api/v1/convert': {
+                'description': 'Convert STL to 3MF (with optional repair)',
+                'params': 'multipart/form-data with "file" field. Optional query: repair=true|false',
+                'returns': '3MF file binary'
+            },
+            'POST /api/v1/orient': {
+                'description': 'Find optimal print orientation for an STL',
+                'params': 'multipart/form-data with "file" field',
+                'returns': 'JSON with top 3 orientations and scores'
+            }
+        },
+        'rate_limits': '100 requests/hour per API key',
+        'max_file_size': '100MB'
+    })
+
+
+@app.route('/api/v1/analyze', methods=['POST'])
+def api_v1_analyze():
+    """API: Upload STL, return full analysis + printability report."""
+    auth_ok = check_api_key()
+    if auth_ok is not True and isinstance(auth_ok, tuple) and not auth_ok[0]:
+        return auth_ok[1], auth_ok[2] if len(auth_ok) > 2 else 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided. Send multipart/form-data with "file" field.'}), 400
+
+    f = request.files['file']
+    if not f.filename.lower().endswith('.stl'):
+        return jsonify({'error': 'Only STL files are supported'}), 400
+
+    try:
+        job_id = str(uuid.uuid4())[:11]
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        f.save(filepath)
+
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+        analysis = analyze_mesh(mesh)
+        printability = analyze_printability(mesh, 'z')
+
+        jobs[job_id] = {
+            'original_path': filepath,
+            'original_name': f.filename,
+            'analysis': analysis,
+            'repaired': False,
+            'repaired_path': None,
+            'created_at': datetime.utcnow().isoformat()
+        }
+
+        return jsonify({
+            'job_id': job_id,
+            'filename': f.filename,
+            'analysis': {
+                'stats': analysis['stats'],
+                'issues': analysis['issues']
+            },
+            'printability': printability['summary']
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/repair', methods=['POST'])
+def api_v1_repair():
+    """API: Upload STL, repair, return fixed file directly."""
+    auth_ok = check_api_key()
+    if auth_ok is not True and isinstance(auth_ok, tuple) and not auth_ok[0]:
+        return auth_ok[1], auth_ok[2] if len(auth_ok) > 2 else 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    f = request.files['file']
+    output_format = request.args.get('format', 'stl').lower()
+
+    try:
+        job_id = str(uuid.uuid4())[:11]
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        f.save(filepath)
+
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+        analysis = analyze_mesh(mesh)
+        repaired_mesh, repairs = repair_mesh(mesh, analysis)
+
+        # Export in requested format
+        if output_format == '3mf':
+            data = repaired_mesh.export(file_type='3mf')
+            mimetype = 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml'
+            ext = '3mf'
+        else:
+            data = repaired_mesh.export(file_type='stl')
+            mimetype = 'application/octet-stream'
+            ext = 'stl'
+
+        # Cleanup
+        os.remove(filepath)
+
+        base_name = os.path.splitext(f.filename)[0]
+        return send_file(
+            io.BytesIO(data),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=f'{base_name}_repaired.{ext}'
+        )
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/analyze-and-repair', methods=['POST'])
+def api_v1_analyze_and_repair():
+    """API: Upload, analyze, repair, return report + download URL."""
+    auth_ok = check_api_key()
+    if auth_ok is not True and isinstance(auth_ok, tuple) and not auth_ok[0]:
+        return auth_ok[1], auth_ok[2] if len(auth_ok) > 2 else 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    f = request.files['file']
+
+    try:
+        job_id = str(uuid.uuid4())[:11]
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        f.save(filepath)
+
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+        analysis = analyze_mesh(mesh)
+
+        # Repair
+        repaired_mesh, repairs = repair_mesh(mesh, analysis)
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], f"{job_id}_repaired.stl")
+        repaired_mesh.export(repaired_path, file_type='stl')
+
+        reanalysis = analyze_mesh(repaired_mesh)
+        printability = analyze_printability(repaired_mesh, 'z')
+
+        jobs[job_id] = {
+            'original_path': filepath,
+            'original_name': f.filename,
+            'analysis': analysis,
+            'repaired': True,
+            'repaired_path': repaired_path,
+            'repairs': repairs,
+            'repaired_analysis': reanalysis,
+            'created_at': datetime.utcnow().isoformat()
+        }
+
+        return jsonify({
+            'job_id': job_id,
+            'filename': f.filename,
+            'original': {
+                'stats': analysis['stats'],
+                'issues': analysis['issues']
+            },
+            'repaired': {
+                'stats': reanalysis['stats'],
+                'issues': reanalysis['issues']
+            },
+            'repairs_performed': repairs,
+            'printability': printability['summary'],
+            'download_url': f'/api/download/{job_id}',
+            'download_3mf_url': f'/api/download/{job_id}?format=3mf'
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/convert', methods=['POST'])
+def api_v1_convert():
+    """API: Convert STL to 3MF with optional repair."""
+    auth_ok = check_api_key()
+    if auth_ok is not True and isinstance(auth_ok, tuple) and not auth_ok[0]:
+        return auth_ok[1], auth_ok[2] if len(auth_ok) > 2 else 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    f = request.files['file']
+    do_repair = request.args.get('repair', 'false').lower() == 'true'
+
+    try:
+        job_id = str(uuid.uuid4())[:11]
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        f.save(filepath)
+
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+
+        if do_repair:
+            analysis = analyze_mesh(mesh)
+            mesh, repairs = repair_mesh(mesh, analysis)
+
+        data = mesh.export(file_type='3mf')
+        os.remove(filepath)
+
+        base_name = os.path.splitext(f.filename)[0]
+        return send_file(
+            io.BytesIO(data),
+            mimetype='application/vnd.ms-package.3dmanufacturing-3dmodel+xml',
+            as_attachment=True,
+            download_name=f'{base_name}.3mf'
+        )
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/orient', methods=['POST'])
+def api_v1_orient():
+    """API: Find optimal print orientation for an STL."""
+    auth_ok = check_api_key()
+    if auth_ok is not True and isinstance(auth_ok, tuple) and not auth_ok[0]:
+        return auth_ok[1], auth_ok[2] if len(auth_ok) > 2 else 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    f = request.files['file']
+
+    try:
+        job_id = str(uuid.uuid4())[:11]
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        f.save(filepath)
+
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+        result = auto_orient(mesh)
+        os.remove(filepath)
+
+        return jsonify({
+            'filename': f.filename,
+            'orientations': result['orientations'],
+            'tested': result['all_tested'],
+            'elapsed': result['elapsed_seconds']
+        })
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ══════════════════════════════════════════════
+# FEATURE 4: STL → 3MF CONVERSION ON DOWNLOAD
+# ══════════════════════════════════════════════
+# (Integrated into existing download endpoint)
+
+# Patch existing download to support format parameter
+# Download endpoint supports format parameter (stl or 3mf)
+
+@app.route('/api/download/<job_id>', methods=['GET'])
+def download(job_id):
+    """Download repaired file. Requires Maker+ subscription. Supports ?format=stl|3mf"""
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Login required', 'auth_required': True}), 401
+    if user.get('tier', 'free') == 'free':
+        return jsonify({'error': 'Maker plan required to download', 'upgrade_required': True}), 403
+
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+
+    job = jobs[job_id]
+    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+    if not mesh_path or not os.path.exists(mesh_path):
+        return jsonify({'error': 'File not found on server'}), 404
+
+    output_format = request.args.get('format', 'stl').lower()
+    base_name = os.path.splitext(job.get('original_name', 'model'))[0]
+
+    if output_format == '3mf':
+        try:
+            mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+            data = mesh.export(file_type='3mf')
+            return send_file(
+                io.BytesIO(data),
+                mimetype='application/vnd.ms-package.3dmanufacturing-3dmodel+xml',
+                as_attachment=True,
+                download_name=f'{base_name}_repaired.3mf'
+            )
+        except Exception as e:
+            return jsonify({'error': f'3MF conversion failed: {e}'}), 500
+    else:
+        return send_file(
+            mesh_path,
+            mimetype='application/octet-stream',
+            as_attachment=True,
+            download_name=f'{base_name}_repaired.stl'
+        )
+
+
+# ──────────────────────────────────────────────
+# Run
+# ──────────────────────────────────────────────
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host='0.0.0.0', port=port, debug=debug)

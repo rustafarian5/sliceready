@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SliceReady — Batch Processing</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#0a0a0a;--surface:#141414;--surface-2:#1a1a1a;--border:#2a2a2a;--text:#e8e8e8;--text-muted:#888;--accent:#00ff88;--accent-dim:#00ff8822;--danger:#ff4444;--danger-dim:#ff444422;--warning:#ffaa00;--warning-dim:#ffaa0022}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh}
+  .header{display:flex;align-items:center;justify-content:space-between;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--surface)}
+  .logo{display:flex;align-items:center;gap:10px}
+  .logo-icon{width:32px;height:32px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center}
+  .logo-icon svg{width:20px;height:20px}
+  .logo-text{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:18px;letter-spacing:-0.5px}
+  .logo-text span{color:var(--accent)}
+  .nav-links{display:flex;gap:16px;align-items:center}
+  .nav-link{color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px;transition:all .2s}
+  .nav-link:hover{color:var(--text);background:var(--surface-2)}
+  .nav-link.active{color:var(--accent);background:var(--accent-dim)}
+  .container{max-width:1100px;margin:0 auto;padding:32px 24px}
+  h1{font-size:28px;font-weight:700;margin-bottom:6px}
+  .subtitle{color:var(--text-muted);font-size:14px;margin-bottom:32px}
+
+  /* Dropzone */
+  .batch-drop{border:2px dashed var(--border);border-radius:16px;padding:48px;text-align:center;cursor:pointer;transition:all .3s;background:var(--surface);margin-bottom:32px}
+  .batch-drop:hover,.batch-drop.dragover{border-color:var(--accent);background:var(--accent-dim)}
+  .batch-drop h3{font-size:18px;margin-bottom:8px}
+  .batch-drop p{color:var(--text-muted);font-size:13px}
+  .file-input{display:none}
+
+  /* Summary bar */
+  .summary-bar{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}
+  .summary-card{flex:1;min-width:140px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:10px}
+  .summary-card .label{font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}
+  .summary-card .val{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:700}
+  .summary-card .val.green{color:var(--accent)}.summary-card .val.red{color:var(--danger)}.summary-card .val.yellow{color:var(--warning)}
+
+  /* Action bar */
+  .action-bar{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap;align-items:center}
+  .action-btn{padding:10px 20px;border:none;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:8px}
+  .action-btn:disabled{opacity:.4;cursor:not-allowed}
+  .action-btn.primary{background:var(--accent);color:var(--bg)}
+  .action-btn.primary:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 4px 16px var(--accent-dim)}
+  .action-btn.secondary{background:var(--surface-2);color:var(--text);border:1px solid var(--border)}
+  .action-btn.secondary:hover:not(:disabled){border-color:var(--text-muted)}
+  .format-toggle{display:flex;gap:0;margin-left:auto}
+  .format-btn{padding:8px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;background:var(--surface);color:var(--text-muted);border:1px solid var(--border);cursor:pointer;transition:all .2s}
+  .format-btn:first-child{border-radius:6px 0 0 6px}.format-btn:last-child{border-radius:0 6px 6px 0}
+  .format-btn.active{background:var(--accent);color:var(--bg);border-color:var(--accent);font-weight:600}
+
+  /* File table */
+  .file-table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+  .file-table th{text-align:left;padding:12px 16px;font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);background:var(--surface-2);border-bottom:1px solid var(--border)}
+  .file-table td{padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
+  .file-table tr:last-child td{border-bottom:none}
+  .file-table tr:hover{background:var(--surface-2)}
+  .fname{font-weight:600;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;padding:3px 8px;border-radius:4px;display:inline-block}
+  .badge.ok{background:var(--accent-dim);color:var(--accent)}
+  .badge.issues{background:var(--danger-dim);color:var(--danger)}
+  .badge.warn{background:var(--warning-dim);color:var(--warning)}
+  .badge.repaired{background:#4488ff22;color:#4488ff}
+  .badge.error{background:#ff444422;color:#ff4444}
+  .mono{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-muted)}
+  .issue-pills{display:flex;gap:4px;flex-wrap:wrap}
+  .issue-pill{font-family:'JetBrains Mono',monospace;font-size:9px;padding:2px 6px;border-radius:3px;background:var(--surface-2);color:var(--text-muted);border:1px solid var(--border)}
+
+  /* Progress overlay */
+  .batch-progress{display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:100;flex-direction:column;align-items:center;justify-content:center}
+  .batch-progress.active{display:flex}
+  .prog-bar-bg{width:300px;height:6px;background:var(--surface-2);border-radius:3px;overflow:hidden;margin-bottom:16px}
+  .prog-bar-fill{height:100%;background:var(--accent);border-radius:3px;transition:width .3s}
+  .prog-text{font-size:16px;margin-bottom:8px}.prog-sub{font-size:13px;color:var(--text-muted)}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spinner{width:32px;height:32px;border:3px solid transparent;border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite;margin-bottom:16px}
+
+  .empty-state{text-align:center;padding:60px 20px;color:var(--text-muted)}
+  .empty-state h3{font-size:16px;color:var(--text);margin-bottom:8px}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo"><div class="logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#0a0a0a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><div class="logo-text">Slice<span>Ready</span></div></div>
+  <div class="nav-links">
+    <a href="/" class="nav-link">Single File</a>
+    <a href="/batch" class="nav-link active">Batch</a>
+    <a href="/api/v1/docs" class="nav-link">API</a>
+  </div>
+</div>
+
+<div class="container">
+  <h1>Batch Processing</h1>
+  <p class="subtitle">Drop a folder of STLs. Analyze and repair all at once. Download as ZIP.</p>
+
+  <div class="batch-drop" id="dropzone">
+    <h3>Drop STL files here</h3>
+    <p>Up to 100 files · Any mix of broken and clean · Results in seconds</p>
+    <input type="file" class="file-input" id="fileInput" accept=".stl" multiple>
+  </div>
+
+  <div id="dashboard" style="display:none">
+    <div class="summary-bar" id="summaryBar">
+      <div class="summary-card"><div class="label">Files</div><div class="val" id="sumTotal">0</div></div>
+      <div class="summary-card"><div class="label">Clean</div><div class="val green" id="sumClean">0</div></div>
+      <div class="summary-card"><div class="label">Issues</div><div class="val red" id="sumIssues">0</div></div>
+      <div class="summary-card"><div class="label">Repaired</div><div class="val" id="sumRepaired" style="color:#4488ff">0</div></div>
+      <div class="summary-card"><div class="label">Errors</div><div class="val yellow" id="sumErrors">0</div></div>
+    </div>
+
+    <div class="action-bar">
+      <button class="action-btn primary" id="repairAllBtn" disabled>🔧 Repair All</button>
+      <button class="action-btn secondary" id="downloadBtn" disabled>📦 Download ZIP</button>
+      <div class="format-toggle">
+        <button class="format-btn active" data-fmt="stl">STL</button>
+        <button class="format-btn" data-fmt="3mf">3MF</button>
+      </div>
+    </div>
+
+    <table class="file-table">
+      <thead><tr><th>File</th><th>Triangles</th><th>Status</th><th>Issues</th><th>Watertight</th></tr></thead>
+      <tbody id="fileTableBody"></tbody>
+    </table>
+  </div>
+
+  <div id="emptyState" class="empty-state">
+    <h3>No files yet</h3>
+    <p>Drop STL files above or click to browse</p>
+  </div>
+</div>
+
+<div class="batch-progress" id="progress">
+  <div class="spinner"></div>
+  <div class="prog-text" id="progText">Processing...</div>
+  <div class="prog-sub" id="progSub"></div>
+  <div class="prog-bar-bg"><div class="prog-bar-fill" id="progFill" style="width:0%"></div></div>
+</div>
+
+<script>
+let batchId=null, batchData=null, downloadFormat='stl';
+
+const dz=document.getElementById('dropzone'),fi=document.getElementById('fileInput');
+dz.addEventListener('click',()=>fi.click());
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')});
+dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length)uploadFiles(e.dataTransfer.files)});
+fi.addEventListener('change',e=>{if(e.target.files.length)uploadFiles(e.target.files)});
+
+document.querySelectorAll('.format-btn').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.format-btn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');downloadFormat=b.dataset.fmt;
+}));
+
+async function uploadFiles(files){
+  const prog=document.getElementById('progress');
+  prog.classList.add('active');
+  document.getElementById('progText').textContent=`Uploading ${files.length} files...`;
+  document.getElementById('progSub').textContent='Analyzing each file';
+  document.getElementById('progFill').style.width='30%';
+
+  const form=new FormData();
+  for(const f of files){
+    if(f.name.toLowerCase().endsWith('.stl'))form.append('files',f);
+  }
+
+  try{
+    const resp=await fetch('/api/batch/upload',{method:'POST',body:form});
+    document.getElementById('progFill').style.width='90%';
+    const data=await resp.json();
+    if(!resp.ok){prog.classList.remove('active');alert(data.error);return}
+
+    batchId=data.batch_id;
+    batchData=data.batch;
+    renderDashboard();
+    document.getElementById('progFill').style.width='100%';
+    setTimeout(()=>prog.classList.remove('active'),300);
+  }catch(e){prog.classList.remove('active');alert(e.message)}
+}
+
+function renderDashboard(){
+  if(!batchData)return;
+  const jobs=batchData.jobs;
+  const clean=jobs.filter(j=>j.status==='analyzed'&&!j.has_issues).length;
+  const issues=jobs.filter(j=>j.has_issues).length;
+  const repaired=jobs.filter(j=>j.status==='repaired').length;
+  const errors=jobs.filter(j=>j.status==='error'||j.status==='repair_failed').length;
+
+  document.getElementById('sumTotal').textContent=jobs.length;
+  document.getElementById('sumClean').textContent=clean;
+  document.getElementById('sumIssues').textContent=issues;
+  document.getElementById('sumRepaired').textContent=repaired;
+  document.getElementById('sumErrors').textContent=errors;
+
+  const tbody=document.getElementById('fileTableBody');
+  tbody.innerHTML=jobs.map(j=>{
+    let statusBadge='';
+    if(j.status==='error'||j.status==='repair_failed')statusBadge=`<span class="badge error">${j.error||'Failed'}</span>`;
+    else if(j.status==='repaired')statusBadge='<span class="badge repaired">Repaired</span>';
+    else if(j.has_issues)statusBadge=`<span class="badge issues">${j.issues} issues</span>`;
+    else statusBadge='<span class="badge ok">Clean</span>';
+
+    const issuesPills=j.issue_list?j.issue_list.map(i=>`<span class="issue-pill">${i.title}</span>`).join(''):'';
+    const tris=j.repaired_triangles||j.triangles;
+    const wt=j.repaired_watertight!==undefined?j.repaired_watertight:j.watertight;
+
+    return `<tr>
+      <td class="fname">${j.filename}</td>
+      <td class="mono">${tris?tris.toLocaleString():'-'}</td>
+      <td>${statusBadge}</td>
+      <td><div class="issue-pills">${issuesPills||'<span class="mono">None</span>'}</div></td>
+      <td class="mono">${wt===true?'✅ Yes':wt===false?'❌ No':'-'}</td>
+    </tr>`}).join('');
+
+  document.getElementById('dashboard').style.display='block';
+  document.getElementById('emptyState').style.display='none';
+
+  const hasIssues=jobs.some(j=>j.has_issues&&j.status!=='repaired');
+  document.getElementById('repairAllBtn').disabled=!hasIssues;
+  document.getElementById('downloadBtn').disabled=false;
+}
+
+document.getElementById('repairAllBtn').addEventListener('click',async()=>{
+  if(!batchId)return;
+  const prog=document.getElementById('progress');
+  prog.classList.add('active');
+  document.getElementById('progText').textContent='Repairing all files...';
+  document.getElementById('progSub').textContent='This may take a minute for large batches';
+  document.getElementById('progFill').style.width='40%';
+
+  try{
+    const resp=await fetch(`/api/batch/repair/${batchId}`,{method:'POST'});
+    document.getElementById('progFill').style.width='90%';
+    const data=await resp.json();
+    batchData=data.batch;
+    renderDashboard();
+    document.getElementById('progFill').style.width='100%';
+    setTimeout(()=>prog.classList.remove('active'),300);
+  }catch(e){prog.classList.remove('active');alert(e.message)}
+});
+
+document.getElementById('downloadBtn').addEventListener('click',()=>{
+  if(!batchId)return;
+  window.location.href=`/api/batch/download/${batchId}?format=${downloadFormat}`;
+});
+</script>
+</body>
+</html>
