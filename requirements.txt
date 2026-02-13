@@ -6,3 +6,4 @@ manifold3d==3.3.2
 numpy==2.2.3
 stripe==11.4.1
 rtree==1.4.1
+networkx==3.2.1
