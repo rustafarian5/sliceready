@@ -500,43 +500,61 @@ def _timeout_handler(signum, frame):
 def _score_result(result_mesh, original_mesh):
     """
     Score a repair result 0-100.
-    Higher = better. Considers watertight status, face preservation,
-    bounding box preservation, and manifold validity.
+    Higher = better.
+
+    CRITICAL RULE: A result that loses >40% of faces is REJECTED regardless
+    of watertight status. A watertight mesh missing half the model is worse
+    than a complete mesh with holes.
     """
     if result_mesh is None or len(result_mesh.faces) == 0:
         return -1
 
-    score = 0
     orig_faces = len(original_mesh.faces)
     result_faces = len(result_mesh.faces)
 
-    # Watertight: 40 points (the whole point of repair)
-    if result_mesh.is_watertight:
-        score += 40
-
-    # Face preservation: up to 30 points
+    # HARD GATE: reject any result that lost >40% of faces
     if orig_faces > 0:
         face_ratio = result_faces / orig_faces
-        if face_ratio >= 0.95:
-            score += 30
-        elif face_ratio >= 0.80:
-            score += 25
-        elif face_ratio >= 0.60:
-            score += 15
-        elif face_ratio >= 0.40:
-            score += 5
+        if face_ratio < 0.60:
+            return -1  # Reject — too much geometry destroyed
 
-    # Bounding box preservation: up to 20 points
+    # Also reject if bounding box shrank drastically
     orig_bbox = np.prod(original_mesh.bounds[1] - original_mesh.bounds[0])
     if orig_bbox > 1e-10 and len(result_mesh.faces) > 0:
         result_bbox = np.prod(result_mesh.bounds[1] - result_mesh.bounds[0])
         bbox_ratio = result_bbox / orig_bbox
-        if bbox_ratio >= 0.90:
-            score += 20
-        elif bbox_ratio >= 0.70:
+        if bbox_ratio < 0.50:
+            return -1  # Reject — model got cut in half
+
+    score = 0
+
+    # Face preservation: up to 40 points (most important!)
+    if orig_faces > 0:
+        if face_ratio >= 0.95:
+            score += 40
+        elif face_ratio >= 0.90:
+            score += 35
+        elif face_ratio >= 0.80:
+            score += 25
+        elif face_ratio >= 0.70:
             score += 15
-        elif bbox_ratio >= 0.50:
+        elif face_ratio >= 0.60:
+            score += 5
+
+    # Watertight: 30 points
+    if result_mesh.is_watertight:
+        score += 30
+
+    # Bounding box preservation: up to 20 points
+    if orig_bbox > 1e-10 and len(result_mesh.faces) > 0:
+        if bbox_ratio >= 0.95:
+            score += 20
+        elif bbox_ratio >= 0.85:
+            score += 15
+        elif bbox_ratio >= 0.70:
             score += 10
+        elif bbox_ratio >= 0.50:
+            score += 5
 
     # Volume validity: up to 10 points
     try:
@@ -640,6 +658,7 @@ def _strategy_boolean_union(mesh):
 
         # If direct fails, try pymeshfix on this body first
         try:
+            body_faces_before = len(body.faces)
             fixer = pymeshfix.MeshFix(body.vertices.copy(), body.faces.copy())
             fixer.repair()
             fixed = trimesh.Trimesh(
@@ -647,14 +666,24 @@ def _strategy_boolean_union(mesh):
                 faces=np.array(fixer.faces),
                 process=True
             )
+            # SAFETY: reject if pymeshfix destroyed >50% of this body's geometry
+            if len(fixed.faces) < body_faces_before * 0.50:
+                logger.info(f"    pymeshfix destroyed body ({body_faces_before} → {len(fixed.faces)} faces) — keeping original")
+                failed_bodies.append(body)
+                continue
+
             mm = manifold3d.Mesh(
                 vert_properties=np.array(fixed.vertices, dtype=np.float64),
                 tri_verts=np.array(fixed.faces, dtype=np.uint32)
             )
             mf = manifold3d.Manifold(mm)
             if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
-                manifolds.append(mf)
-                continue
+                # Also check manifold didn't destroy geometry
+                if mf.num_tri() >= body_faces_before * 0.50:
+                    manifolds.append(mf)
+                    continue
+                else:
+                    logger.info(f"    manifold3d destroyed body ({body_faces_before} → {mf.num_tri()} faces) — keeping original")
         except:
             pass
 
@@ -699,6 +728,7 @@ def _strategy_pymeshfix(mesh):
     Strategy B: Full pymeshfix repair on the whole mesh.
     """
     try:
+        orig_faces = len(mesh.faces)
         fixer = pymeshfix.MeshFix(mesh.vertices.copy(), mesh.faces.copy())
         fixer.repair()
 
@@ -709,6 +739,11 @@ def _strategy_pymeshfix(mesh):
             return None, "pymeshfix returned empty mesh"
 
         result = trimesh.Trimesh(vertices=result_verts, faces=result_faces, process=True)
+
+        # Safety: reject if pymeshfix destroyed too much geometry
+        if len(result.faces) < orig_faces * 0.50:
+            return None, f"pymeshfix destroyed geometry ({orig_faces} → {len(result.faces)} faces)"
+
         return result, "pymeshfix full repair"
 
     except Exception as e:
@@ -720,6 +755,7 @@ def _strategy_pymeshfix_then_manifold(mesh):
     Strategy C: pymeshfix first to close holes, then manifold3d to validate.
     """
     try:
+        orig_faces = len(mesh.faces)
         fixer = pymeshfix.MeshFix(mesh.vertices.copy(), mesh.faces.copy())
         fixer.repair()
         fixed = trimesh.Trimesh(
@@ -730,6 +766,10 @@ def _strategy_pymeshfix_then_manifold(mesh):
 
         if len(fixed.faces) == 0:
             return None, "pymeshfix returned empty"
+
+        # Safety: reject if pymeshfix destroyed too much geometry
+        if len(fixed.faces) < orig_faces * 0.50:
+            return None, f"pymeshfix destroyed geometry ({orig_faces} → {len(fixed.faces)} faces)"
 
         mm = manifold3d.Mesh(
             vert_properties=np.array(fixed.vertices, dtype=np.float64),
