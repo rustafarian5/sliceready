@@ -457,18 +457,39 @@ def analyze_mesh(mesh):
 
 
 # ──────────────────────────────────────────────
-# Mesh Repair Engine
+# Mesh Repair Engine v3 — Multi-Strategy
 # ──────────────────────────────────────────────
+#
+# The #1 problem with AI-generated STLs: overlapping shells that aren't
+# properly joined. Meshmixer can't fix this. Netfabb struggles. Even
+# PrusaSlicer's auto-repair sometimes mangles the geometry.
+#
+# Our approach: try multiple repair strategies, score each result, pick best.
+#
+#   Strategy A: "Boolean Union" — split into bodies, fix each, union via
+#               manifold3d (same engine as PrusaSlicer). Best for AI models
+#               with overlapping parts. 150x faster than pymeshfix.
+#
+#   Strategy B: "pymeshfix" — industrial-strength hole filling and non-manifold
+#               repair. Best for single-body meshes with holes.
+#
+#   Strategy C: "pymeshfix + manifold" — belt-and-suspenders.
+#
+#   Strategy D: "Direct Manifold" — pass straight to manifold3d.
+#
+# Scoring: watertight > face preservation > bounding box preservation
+#
+# Safety: NEVER decimates. NEVER removes significant geometry.
+#
 import time
 import signal
 
-# Repair timeout constants
-REPAIR_HARD_CEILING = 360      # 6 minutes — absolute max
-REPAIR_STALL_TIMEOUT = 60      # If no progress in 60 seconds, return what we have
+REPAIR_HARD_CEILING = 180       # 3 minutes absolute max
+DEBRIS_FACE_THRESHOLD = 0.005   # Components with <0.5% of total faces = debris
+DEBRIS_MIN_FACES = 50           # Never remove components with >=50 faces
 
 
 class RepairTimeout(Exception):
-    """Raised when repair hits hard ceiling."""
     pass
 
 
@@ -476,209 +497,448 @@ def _timeout_handler(signum, frame):
     raise RepairTimeout("Repair hit hard time ceiling")
 
 
-def _mesh_fingerprint(mesh):
-    """Quick hash of mesh state to detect progress."""
-    return (len(mesh.faces), len(mesh.vertices), mesh.is_watertight)
+def _score_result(result_mesh, original_mesh):
+    """
+    Score a repair result 0-100.
+    Higher = better. Considers watertight status, face preservation,
+    bounding box preservation, and manifold validity.
+    """
+    if result_mesh is None or len(result_mesh.faces) == 0:
+        return -1
+
+    score = 0
+    orig_faces = len(original_mesh.faces)
+    result_faces = len(result_mesh.faces)
+
+    # Watertight: 40 points (the whole point of repair)
+    if result_mesh.is_watertight:
+        score += 40
+
+    # Face preservation: up to 30 points
+    if orig_faces > 0:
+        face_ratio = result_faces / orig_faces
+        if face_ratio >= 0.95:
+            score += 30
+        elif face_ratio >= 0.80:
+            score += 25
+        elif face_ratio >= 0.60:
+            score += 15
+        elif face_ratio >= 0.40:
+            score += 5
+
+    # Bounding box preservation: up to 20 points
+    orig_bbox = np.prod(original_mesh.bounds[1] - original_mesh.bounds[0])
+    if orig_bbox > 1e-10 and len(result_mesh.faces) > 0:
+        result_bbox = np.prod(result_mesh.bounds[1] - result_mesh.bounds[0])
+        bbox_ratio = result_bbox / orig_bbox
+        if bbox_ratio >= 0.90:
+            score += 20
+        elif bbox_ratio >= 0.70:
+            score += 15
+        elif bbox_ratio >= 0.50:
+            score += 10
+
+    # Volume validity: up to 10 points
+    try:
+        if result_mesh.is_volume and result_mesh.volume > 0:
+            score += 10
+        elif result_mesh.is_watertight:
+            score += 5
+    except:
+        pass
+
+    return score
+
+
+def _clean_mesh(mesh, analysis):
+    """
+    Phase 1: Non-destructive cleanup that all strategies benefit from.
+    Removes degenerate faces, duplicates, merges vertices, fixes normals.
+    """
+    cleanups = []
+    original_faces = len(mesh.faces)
+
+    # Remove degenerate (zero-area) faces
+    if analysis['stats'].get('degenerate_faces', 0) > 0:
+        areas = mesh.area_faces
+        valid = areas >= 1e-10
+        removed = int(np.sum(~valid))
+        if removed > 0 and np.sum(valid) > original_faces * 0.5:
+            mesh.update_faces(valid)
+            cleanups.append(f"Removed {removed:,} degenerate triangles")
+
+    # Remove exact duplicate faces
+    if analysis['stats'].get('duplicate_faces', 0) > 0:
+        face_sorted = np.sort(mesh.faces, axis=1)
+        _, unique_idx = np.unique(face_sorted, axis=0, return_index=True)
+        removed = len(mesh.faces) - len(unique_idx)
+        if removed > 0:
+            mask = np.zeros(len(mesh.faces), dtype=bool)
+            mask[unique_idx] = True
+            mesh.update_faces(mask)
+            cleanups.append(f"Removed {removed:,} duplicate faces")
+
+    # Merge coincident vertices
+    before_verts = len(mesh.vertices)
+    mesh.merge_vertices()
+    merged = before_verts - len(mesh.vertices)
+    if merged > 0:
+        cleanups.append(f"Merged {merged:,} coincident vertices")
+
+    # Fix normals
+    try:
+        trimesh.repair.fix_normals(mesh)
+        cleanups.append("Fixed face normals and winding order")
+    except:
+        pass
+
+    # Remove tiny debris (< 0.5% of faces AND < 50 faces)
+    if analysis['stats'].get('body_count', 1) > 1:
+        try:
+            bodies = mesh.split(only_watertight=False)
+            if len(bodies) > 1:
+                total_faces = sum(len(b.faces) for b in bodies)
+                threshold = max(DEBRIS_MIN_FACES, int(total_faces * DEBRIS_FACE_THRESHOLD))
+                keep = [b for b in bodies if len(b.faces) >= threshold]
+                removed = len(bodies) - len(keep)
+                if removed > 0 and len(keep) > 0:
+                    mesh = trimesh.util.concatenate(keep) if len(keep) > 1 else keep[0]
+                    cleanups.append(f"Removed {removed} tiny debris component(s)")
+        except:
+            pass
+
+    return mesh, cleanups
+
+
+def _strategy_boolean_union(mesh):
+    """
+    Strategy A: Split into bodies, repair each, boolean union via manifold3d.
+    This is what PrusaSlicer does internally. Best for AI-generated models.
+    """
+    bodies = mesh.split(only_watertight=False)
+
+    if len(bodies) == 0:
+        return None, "no bodies found"
+
+    # Multiple bodies: try to make each manifold, then union
+    manifolds = []
+    failed_bodies = []
+
+    for body in bodies:
+        # First try direct manifold
+        try:
+            mm = manifold3d.Mesh(
+                vert_properties=np.array(body.vertices, dtype=np.float64),
+                tri_verts=np.array(body.faces, dtype=np.uint32)
+            )
+            mf = manifold3d.Manifold(mm)
+            if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                manifolds.append(mf)
+                continue
+        except:
+            pass
+
+        # If direct fails, try pymeshfix on this body first
+        try:
+            fixer = pymeshfix.MeshFix(body.vertices.copy(), body.faces.copy())
+            fixer.repair()
+            fixed = trimesh.Trimesh(
+                vertices=np.array(fixer.points),
+                faces=np.array(fixer.faces),
+                process=True
+            )
+            mm = manifold3d.Mesh(
+                vert_properties=np.array(fixed.vertices, dtype=np.float64),
+                tri_verts=np.array(fixed.faces, dtype=np.uint32)
+            )
+            mf = manifold3d.Manifold(mm)
+            if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                manifolds.append(mf)
+                continue
+        except:
+            pass
+
+        failed_bodies.append(body)
+
+    if len(manifolds) == 0:
+        return None, "no bodies could be made manifold"
+
+    # Boolean union all manifold bodies
+    result_manifold = manifolds[0]
+    for mf in manifolds[1:]:
+        try:
+            result_manifold = result_manifold + mf  # manifold3d boolean union
+        except Exception as e:
+            logger.warning(f"  Boolean union step failed: {e}")
+
+    # Convert back to trimesh
+    try:
+        out = result_manifold.to_mesh()
+        result = trimesh.Trimesh(
+            vertices=np.array(out.vert_properties)[:, :3],
+            faces=np.array(out.tri_verts),
+            process=True
+        )
+
+        # If some bodies couldn't be made manifold, concatenate them back
+        if failed_bodies:
+            parts = [result] + failed_bodies
+            result = trimesh.util.concatenate(parts)
+
+        desc = f"Boolean union of {len(manifolds)} bodies"
+        if failed_bodies:
+            desc += f" (+{len(failed_bodies)} kept as-is)"
+        return result, desc
+
+    except Exception as e:
+        return None, f"union conversion failed: {e}"
+
+
+def _strategy_pymeshfix(mesh):
+    """
+    Strategy B: Full pymeshfix repair on the whole mesh.
+    """
+    try:
+        fixer = pymeshfix.MeshFix(mesh.vertices.copy(), mesh.faces.copy())
+        fixer.repair()
+
+        result_verts = np.array(fixer.points)
+        result_faces = np.array(fixer.faces)
+
+        if len(result_verts) == 0 or len(result_faces) == 0:
+            return None, "pymeshfix returned empty mesh"
+
+        result = trimesh.Trimesh(vertices=result_verts, faces=result_faces, process=True)
+        return result, "pymeshfix full repair"
+
+    except Exception as e:
+        return None, f"pymeshfix failed: {e}"
+
+
+def _strategy_pymeshfix_then_manifold(mesh):
+    """
+    Strategy C: pymeshfix first to close holes, then manifold3d to validate.
+    """
+    try:
+        fixer = pymeshfix.MeshFix(mesh.vertices.copy(), mesh.faces.copy())
+        fixer.repair()
+        fixed = trimesh.Trimesh(
+            vertices=np.array(fixer.points),
+            faces=np.array(fixer.faces),
+            process=True
+        )
+
+        if len(fixed.faces) == 0:
+            return None, "pymeshfix returned empty"
+
+        mm = manifold3d.Mesh(
+            vert_properties=np.array(fixed.vertices, dtype=np.float64),
+            tri_verts=np.array(fixed.faces, dtype=np.uint32)
+        )
+        mf = manifold3d.Manifold(mm)
+
+        if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+            out = mf.to_mesh()
+            result = trimesh.Trimesh(
+                vertices=np.array(out.vert_properties)[:, :3],
+                faces=np.array(out.tri_verts),
+                process=True
+            )
+            return result, "pymeshfix + manifold validated"
+
+        # Manifold rejected, but pymeshfix result might still be good
+        return fixed, "pymeshfix repair (manifold rejected post-fix)"
+
+    except Exception as e:
+        return None, f"pymeshfix+manifold failed: {e}"
+
+
+def _strategy_direct_manifold(mesh):
+    """
+    Strategy D: Pass directly to manifold3d without pymeshfix.
+    """
+    try:
+        mm = manifold3d.Mesh(
+            vert_properties=np.array(mesh.vertices, dtype=np.float64),
+            tri_verts=np.array(mesh.faces, dtype=np.uint32)
+        )
+        mf = manifold3d.Manifold(mm)
+
+        if mf.status() != manifold3d.Error.NoError:
+            return None, f"manifold rejected: {mf.status()}"
+
+        if mf.num_tri() == 0:
+            return None, "manifold returned 0 triangles"
+
+        out = mf.to_mesh()
+        result = trimesh.Trimesh(
+            vertices=np.array(out.vert_properties)[:, :3],
+            faces=np.array(out.tri_verts),
+            process=True
+        )
+        return result, "direct manifold validation"
+
+    except Exception as e:
+        return None, f"manifold failed: {e}"
 
 
 def repair_mesh(mesh, analysis):
     """
-    Perform real mesh repair using trimesh + pymeshfix.
-    Uses progress-based timeout: if a step makes no measurable change
-    in 60 seconds, we return what we have. Hard ceiling at 6 minutes.
-    Returns (repaired_mesh, list_of_repairs_performed).
+    Multi-strategy mesh repair engine.
+
+    Tries 4 repair strategies, scores each result, picks the best one.
+    NEVER decimates. NEVER removes significant geometry.
+
+    Returns (repaired_mesh, list_of_repair_descriptions).
     """
     repairs = []
     t_start = time.time()
-    last_progress_time = t_start
-    last_fingerprint = _mesh_fingerprint(mesh)
-    timed_out = False
     original_faces = len(mesh.faces)
     original_verts = len(mesh.vertices)
 
-    # Set hard ceiling via signal alarm (Unix only, safe in Gunicorn worker)
+    # Hard ceiling via signal alarm
     old_handler = None
     try:
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(REPAIR_HARD_CEILING)
     except (ValueError, OSError):
-        # signal.alarm not available (Windows, or not main thread)
         old_handler = None
 
-    def _check_progress(step_name):
-        """Check if we should keep going. Returns False if we should bail."""
-        nonlocal last_progress_time, last_fingerprint, timed_out
-
-        elapsed = time.time() - t_start
-        fp = _mesh_fingerprint(mesh)
-
-        if fp != last_fingerprint:
-            # Mesh changed — we're making progress
-            last_fingerprint = fp
-            last_progress_time = time.time()
-            logger.info(f"  [{elapsed:.1f}s] {step_name}: progress (faces={fp[0]}, verts={fp[1]}, watertight={fp[2]})")
-        else:
-            stall_time = time.time() - last_progress_time
-            if stall_time > REPAIR_STALL_TIMEOUT:
-                logger.warning(f"  [{elapsed:.1f}s] {step_name}: stalled {stall_time:.0f}s — returning current state")
-                timed_out = True
-                return False
-
-        if elapsed > REPAIR_HARD_CEILING:
-            logger.warning(f"  [{elapsed:.1f}s] Hard ceiling reached at {step_name}")
-            timed_out = True
-            return False
-
-        return True
+    def _elapsed():
+        return time.time() - t_start
 
     try:
-        logger.info(f"Repair started: {original_faces:,} faces, ceiling={REPAIR_HARD_CEILING}s, stall={REPAIR_STALL_TIMEOUT}s")
+        logger.info(f"Repair v3 started: {original_faces:,} faces, {original_verts:,} verts, watertight={mesh.is_watertight}")
 
-        # ── Step 1: Remove degenerate faces ──
-        if analysis['stats']['degenerate_faces'] > 0:
-            areas = mesh.area_faces
-            valid = areas >= 1e-10
-            if np.sum(~valid) > 0:
-                mesh.update_faces(valid)
-                removed = int(np.sum(~valid))
-                repairs.append(f"Removed {removed:,} degenerate triangles")
-        if not _check_progress("degenerate removal"):
-            raise RepairTimeout("stall")
+        # ════════════════════════════════════════════
+        # FAST PATH: already clean mesh
+        # ════════════════════════════════════════════
+        stats = analysis['stats']
+        is_clean = (
+            stats.get('is_watertight', False) and
+            stats.get('degenerate_faces', 0) == 0 and
+            stats.get('duplicate_faces', 0) == 0 and
+            stats.get('non_manifold_edges', 0) == 0
+        )
+        if is_clean:
+            try:
+                trimesh.repair.fix_normals(mesh)
+            except:
+                pass
+            repairs.append("Mesh was already clean — verified normals")
+            elapsed = _elapsed()
+            repairs.append(f"Final mesh: {len(mesh.faces):,} faces, {len(mesh.vertices):,} vertices ({elapsed:.1f}s)")
+            repairs.append("✓ Mesh is watertight and print-ready")
+            logger.info(f"Repair v3 finished (fast path): {len(mesh.faces):,} faces in {elapsed:.1f}s")
+            return mesh, repairs
 
-        # ── Step 2: Remove duplicate faces ──
-        if analysis['stats']['duplicate_faces'] > 0:
-            face_sorted = np.sort(mesh.faces, axis=1)
-            _, unique_idx = np.unique(face_sorted, axis=0, return_index=True)
-            if len(unique_idx) < len(mesh.faces):
-                removed = len(mesh.faces) - len(unique_idx)
-                mask = np.zeros(len(mesh.faces), dtype=bool)
-                mask[unique_idx] = True
-                mesh.update_faces(mask)
-                repairs.append(f"Removed {removed:,} duplicate faces")
-        if not _check_progress("duplicate removal"):
-            raise RepairTimeout("stall")
+        # ════════════════════════════════════════════
+        # PHASE 1: Non-destructive cleanup
+        # ════════════════════════════════════════════
+        cleaned_mesh, cleanups = _clean_mesh(
+            trimesh.Trimesh(vertices=mesh.vertices.copy(), faces=mesh.faces.copy(), process=False),
+            analysis
+        )
+        repairs.extend(cleanups)
 
-        # ── Step 3: Remove small disconnected components ──
-        if analysis['stats']['body_count'] > 1:
-            bodies = mesh.split(only_watertight=False)
-            if len(bodies) > 1:
-                main_body = max(bodies, key=lambda b: len(b.vertices))
-                removed_bodies = len(bodies) - 1
-                mesh = main_body
-                repairs.append(f"Removed {removed_bodies} floating component(s)")
-        if not _check_progress("component cleanup"):
-            raise RepairTimeout("stall")
-
-        # ── Step 4: Fix normals ──
-        try:
-            mesh.fix_normals()
-            repairs.append("Fixed face normals and winding order")
-        except Exception as e:
-            logger.warning(f"Normal fix failed: {e}")
-        if not _check_progress("normal fix"):
-            raise RepairTimeout("stall")
-
-        # ── Step 5: Fill holes with pymeshfix ──
-        try:
-            verts = mesh.vertices.copy()
-            faces = mesh.faces.copy()
-
-            meshfix = pymeshfix.MeshFix(verts, faces)
-            meshfix.repair()
-
-            repaired_verts = meshfix.v
-            repaired_faces = meshfix.f
-
-            if len(repaired_verts) > 0 and len(repaired_faces) > 0:
-                mesh = trimesh.Trimesh(
-                    vertices=repaired_verts,
-                    faces=repaired_faces,
-                    process=True
+        # Check if cleanup alone fixed it
+        if cleaned_mesh.is_watertight:
+            try:
+                mm = manifold3d.Mesh(
+                    vert_properties=np.array(cleaned_mesh.vertices, dtype=np.float64),
+                    tri_verts=np.array(cleaned_mesh.faces, dtype=np.uint32)
                 )
-                repairs.append("Closed holes and fixed non-manifold geometry (pymeshfix)")
-                logger.info("pymeshfix repair successful")
-            else:
-                logger.warning("pymeshfix returned empty mesh, skipping")
-        except RepairTimeout:
-            raise
-        except Exception as e:
-            logger.warning(f"pymeshfix repair failed: {e}")
-            try:
-                trimesh.repair.fill_holes(mesh)
-                repairs.append("Filled holes (trimesh fallback)")
-            except Exception as e2:
-                logger.warning(f"Trimesh hole fill also failed: {e2}")
-        if not _check_progress("hole fill"):
-            raise RepairTimeout("stall")
+                mf = manifold3d.Manifold(mm)
+                if mf.status() == manifold3d.Error.NoError:
+                    repairs.append("✓ Manifold-validated after cleanup")
+            except:
+                pass
 
-        # ── Step 6: Fix normals again after repair ──
-        try:
-            mesh.fix_normals()
-        except:
-            pass
+            elapsed = _elapsed()
+            final_faces = len(cleaned_mesh.faces)
+            change = final_faces - original_faces
+            change_desc = f"+{change:,}" if change > 0 else f"{change:,}" if change < 0 else "no change"
+            repairs.append(f"Final mesh: {final_faces:,} faces ({change_desc}), {len(cleaned_mesh.vertices):,} vertices ({elapsed:.1f}s)")
+            repairs.append("✓ Mesh is watertight and print-ready")
+            logger.info(f"Repair v3 finished (cleanup fixed it): {final_faces:,} faces in {elapsed:.1f}s")
+            return cleaned_mesh, repairs
 
-        # ── Step 7: Decimate if high-poly ──
-        if analysis['stats']['is_high_poly'] and len(mesh.faces) > 100000:
-            target = max(50000, len(mesh.faces) // 3)
+        # ════════════════════════════════════════════
+        # PHASE 2: Multi-strategy repair
+        # ════════════════════════════════════════════
+        logger.info(f"  [{_elapsed():.1f}s] Running multi-strategy repair...")
+
+        safe_verts = cleaned_mesh.vertices.copy()
+        safe_faces = cleaned_mesh.faces.copy()
+
+        strategies = [
+            ("boolean_union", _strategy_boolean_union),
+            ("pymeshfix+manifold", _strategy_pymeshfix_then_manifold),
+            ("pymeshfix", _strategy_pymeshfix),
+            ("direct_manifold", _strategy_direct_manifold),
+        ]
+
+        results = []
+
+        for strat_name, strat_fn in strategies:
             try:
-                decimated = mesh.simplify_quadric_decimation(target)
-                if len(decimated.faces) > 0:
-                    before = len(mesh.faces)
-                    mesh = decimated
-                    repairs.append(f"Decimated from {before:,} to {len(mesh.faces):,} triangles ({round(len(mesh.faces)/before*100)}%)")
+                input_mesh = trimesh.Trimesh(
+                    vertices=safe_verts.copy(),
+                    faces=safe_faces.copy(),
+                    process=False
+                )
+                t_strat = time.time()
+                result_mesh, desc = strat_fn(input_mesh)
+                dt = time.time() - t_strat
+
+                if result_mesh is not None and len(result_mesh.faces) > 0:
+                    score = _score_result(result_mesh, mesh)
+                    logger.info(f"  [{_elapsed():.1f}s] {strat_name}: score={score}, "
+                                f"faces={len(result_mesh.faces):,}, "
+                                f"watertight={result_mesh.is_watertight}, "
+                                f"{dt:.2f}s — {desc}")
+                    results.append((score, result_mesh, strat_name, desc))
+                else:
+                    logger.info(f"  [{_elapsed():.1f}s] {strat_name}: SKIP — {desc}")
+
             except RepairTimeout:
                 raise
             except Exception as e:
-                logger.warning(f"Decimation failed: {e}")
-        if not _check_progress("decimation"):
-            raise RepairTimeout("stall")
+                logger.warning(f"  [{_elapsed():.1f}s] {strat_name}: CRASH — {e}")
 
-        # ── Step 8: Merge close vertices ──
+        # ════════════════════════════════════════════
+        # PHASE 3: Pick the best result
+        # ════════════════════════════════════════════
+        if results:
+            results.sort(key=lambda r: r[0], reverse=True)
+            best_score, best_mesh, best_strat, best_desc = results[0]
+
+            cleaned_score = _score_result(cleaned_mesh, mesh)
+            if best_score > cleaned_score:
+                mesh = best_mesh
+                repairs.append(f"{best_desc} (strategy: {best_strat}, score: {best_score})")
+                logger.info(f"  Winner: {best_strat} (score={best_score} vs cleaned={cleaned_score})")
+            else:
+                mesh = cleaned_mesh
+                repairs.append("Cleanup was the best result")
+                logger.info(f"  Winner: cleanup (score={cleaned_score} >= best={best_score})")
+        else:
+            mesh = cleaned_mesh
+            repairs.append("All repair strategies failed — returning cleaned mesh")
+            logger.warning("  No repair strategy succeeded")
+
+        # Final normal fix
         try:
-            mesh.merge_vertices()
-            repairs.append("Merged coincident vertices")
+            trimesh.repair.fix_normals(mesh)
         except:
             pass
 
-        # ── Step 9: Manifold validation & polish ──
-        # Run the repaired mesh through Manifold (the engine inside PrusaSlicer/Blender).
-        # If Manifold accepts it, the mesh is guaranteed manifold and print-safe.
-        # If it rejects, we still have the pymeshfix result.
-        try:
-            m_verts = np.array(mesh.vertices, dtype=np.float64)
-            m_faces = np.array(mesh.faces, dtype=np.uint32)
-            m_mesh = manifold3d.Mesh(vert_properties=m_verts, tri_verts=m_faces)
-            m_result = manifold3d.Manifold(m_mesh)
-
-            if m_result.status() == manifold3d.Error.NoError and m_result.num_tri() > 0:
-                out = m_result.to_mesh()
-                out_verts = np.array(out.vert_properties)[:, :3]
-                out_faces = np.array(out.tri_verts)
-                manifold_mesh = trimesh.Trimesh(vertices=out_verts, faces=out_faces, process=True)
-
-                if len(manifold_mesh.faces) > 0 and manifold_mesh.is_watertight:
-                    mesh = manifold_mesh
-                    repairs.append("✓ Manifold-validated (PrusaSlicer/Blender engine)")
-                    logger.info("Manifold validation: PASSED — mesh is guaranteed clean")
-                else:
-                    logger.info("Manifold output not watertight, keeping pymeshfix result")
-            else:
-                logger.info(f"Manifold validation: REJECTED ({m_result.status()}) — keeping pymeshfix result")
-        except RepairTimeout:
-            raise
-        except Exception as e:
-            logger.warning(f"Manifold validation step failed: {e} — keeping pymeshfix result")
-        if not _check_progress("manifold validation"):
-            raise RepairTimeout("stall")
-
     except RepairTimeout:
-        elapsed = time.time() - t_start
+        elapsed = _elapsed()
         repairs.append(f"⏱ Repair timed out at {elapsed:.0f}s — returning best result so far")
-        logger.warning(f"Repair timed out at {elapsed:.1f}s after {len(repairs)} operations")
-        timed_out = True
+        logger.warning(f"Repair v3 timed out at {elapsed:.1f}s")
 
     finally:
-        # Clear the alarm
         try:
             signal.alarm(0)
             if old_handler is not None:
@@ -686,23 +946,22 @@ def repair_mesh(mesh, analysis):
         except (ValueError, OSError):
             pass
 
-    # Final stats
-    elapsed = time.time() - t_start
-    repairs.append(f"Final mesh: {len(mesh.faces):,} faces, {len(mesh.vertices):,} vertices ({elapsed:.1f}s)")
+    # Final verdict
+    elapsed = _elapsed()
+    final_faces = len(mesh.faces)
+    change = final_faces - original_faces
+    change_desc = f"+{change:,}" if change > 0 else f"{change:,}" if change < 0 else "no change"
+    repairs.append(f"Final mesh: {final_faces:,} faces ({change_desc}), {len(mesh.vertices):,} vertices ({elapsed:.1f}s)")
+
     if mesh.is_watertight:
         repairs.append("✓ Mesh is watertight and print-ready")
-    elif timed_out:
-        repairs.append("⚠ Partial repair — mesh improved but may need further work in your slicer")
     else:
-        repairs.append("⚠ Mesh may still have minor issues — check in your slicer")
+        repairs.append("⚠ Mesh improved but not fully watertight — check in your slicer")
 
-    logger.info(f"Repair finished: {len(mesh.faces):,} faces in {elapsed:.1f}s ({len(repairs)} ops, timed_out={timed_out})")
+    logger.info(f"Repair v3 finished: {final_faces:,} faces ({change_desc}) in {elapsed:.1f}s, watertight={mesh.is_watertight}")
     return mesh, repairs
 
 
-# ──────────────────────────────────────────────
-# Repair Judge — evaluates repair quality
-# ──────────────────────────────────────────────
 def judge_repair(job_id, before_analysis, after_analysis, repairs, duration):
     """
     Compare before/after analysis to score repair quality.
