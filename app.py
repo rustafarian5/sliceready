@@ -1280,30 +1280,11 @@ def upload():
 
 @app.route('/api/repair/<job_id>', methods=['POST'])
 def repair(job_id):
-    """Run real mesh repair on uploaded file. Requires Maker+ subscription."""
-    # ── Auth + Usage Check ──
+    """Run real mesh repair on uploaded file. Free during beta."""
+    # ── Beta mode: no auth required ──
     user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Login required to repair files', 'auth_required': True}), 401
-
-    user_tier = user.get('tier', 'free')
-    if user_tier == 'free':
-        return jsonify({
-            'error': 'Maker plan required to repair and download files',
-            'upgrade_required': True,
-            'current_tier': 'free'
-        }), 403
-
-    used, limit = get_user_usage(user)
-    if used >= limit:
-        return jsonify({
-            'error': f'Monthly repair limit reached ({used}/{limit}). Upgrade to Pro for unlimited.',
-            'limit_reached': True,
-            'used': used,
-            'limit': limit,
-            'current_tier': user_tier
-        }), 429
-
+    # Track usage if logged in, but don't block if not
+    
     if job_id not in jobs:
         return jsonify({'error': 'Job not found'}), 404
 
@@ -1354,11 +1335,14 @@ def repair(job_id):
         job['repaired_analysis'] = reanalysis
         job['verdict'] = verdict
 
-        # Track usage
-        increment_usage(user)
-        used, limit = get_user_usage(user)
+        # Track usage if logged in
+        used, limit = 0, 0
+        if user:
+            increment_usage(user)
+            used, limit = get_user_usage(user)
 
-        logger.info(f"Repair complete: {job_id} — {len(repairs)} operations, grade={verdict['grade']} ({user['email']}: {used}/{limit})")
+        user_label = user['email'] if user else 'anonymous'
+        logger.info(f"Repair complete: {job_id} — {len(repairs)} operations, grade={verdict['grade']} ({user_label}: {used}/{limit})")
 
         return jsonify({
             'job_id': job_id,
@@ -1366,7 +1350,7 @@ def repair(job_id):
             'mesh_data': mesh_data,
             'analysis': reanalysis,
             'verdict': verdict,
-            'usage': {'used': used, 'limit': limit}
+            'usage': {'used': used, 'limit': limit} if user else None
         })
 
     except Exception as e:
@@ -2353,13 +2337,7 @@ def api_v1_orient():
 
 @app.route('/api/download/<job_id>', methods=['GET'])
 def download(job_id):
-    """Download repaired file. Requires Maker+ subscription. Supports ?format=stl|3mf"""
-    user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Login required', 'auth_required': True}), 401
-    if user.get('tier', 'free') == 'free':
-        return jsonify({'error': 'Maker plan required to download', 'upgrade_required': True}), 403
-
+    """Download repaired file. Free during beta."""
     if job_id not in jobs:
         return jsonify({'error': 'Job not found'}), 404
 

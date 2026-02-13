@@ -221,7 +221,7 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
 </style>
 </head>
 <body>
-<div class="header"><div class="logo"><a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none"><div class="logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#0a0a0a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><div class="logo-text">Slice<span>Ready</span></div></a></div><div style="display:flex;gap:16px;align-items:center"><a href="/app" style="color:var(--accent);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px;background:var(--accent-dim)">Single File</a><a href="/batch" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">Batch</a><a href="/api/v1/docs" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">API</a><div class="auth-bar" id="authBar"><button class="auth-btn primary" onclick="showAuth('signup')">Sign up free</button><button class="auth-btn" onclick="showAuth('login')">Log in</button></div></div></div>
+<div class="header"><div class="logo"><a href="/" style="display:flex;align-items:center;gap:10px;text-decoration:none"><div class="logo-icon"><svg viewBox="0 0 24 24" fill="none" stroke="#0a0a0a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div><div class="logo-text">Slice<span>Ready</span></div></a></div><div style="display:flex;gap:16px;align-items:center"><a href="/app" style="color:var(--accent);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px;background:var(--accent-dim)">Single File</a><a href="/batch" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">Batch</a><a href="/api/v1/docs" style="color:var(--text-muted);text-decoration:none;font-size:13px;font-family:'JetBrains Mono',monospace;padding:6px 12px;border-radius:6px">API</a><div class="auth-bar" id="authBar"><span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);padding:6px 12px;border:1px solid var(--accent);border-radius:6px">✨ Free beta</span></div></div></div>
 
 <!-- Auth Modal -->
 <div class="modal-overlay" id="authModal">
@@ -363,7 +363,7 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
     <div class="panel-section"><div class="section-header"><span class="section-title">Issues</span><span id="issueCount" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-muted)"></span></div><div class="issue-list" id="issueList"><div class="issue-card"><div class="issue-icon warn">⏳</div><div class="issue-info"><h4>Analyzing...</h4><p>Running mesh analysis.</p></div></div></div></div>
   </div>
 </div>
-<div class="upload-overlay" id="uploadOverlay"><div class="spinner"></div><p id="overlayText">Uploading & analyzing...</p><div class="sub">Running heatmap + auto-orient</div></div>
+<div class="upload-overlay" id="uploadOverlay"><div class="spinner"></div><p id="overlayText">Uploading & analyzing...</p><div class="sub" id="overlayTimer"></div><div class="sub" id="overlayHint" style="margin-top:12px;font-size:12px;opacity:0.6"></div></div>
 <div class="toast" id="toast"></div>
 
 <!-- Auth Modal -->
@@ -427,15 +427,8 @@ function showAuth(mode='signup'){
 function hideAuth(){document.getElementById('authModal').classList.remove('active')}
 
 function updateAuthUI(){
-  const bar=document.getElementById('authBar');
-  if(!authUser){
-    bar.innerHTML='<button class="auth-btn primary" onclick="showAuth(\'signup\')">Sign up free</button><button class="auth-btn" onclick="showAuth(\'login\')">Log in</button>';
-    return;
-  }
-  const t=authUser.tier||'free';
-  const u=authUser.usage||{used:0,limit:0};
-  let usageText=t==='free'?'':( ` <span class="usage-pill">${u.used}/${u.limit} repairs</span>`);
-  bar.innerHTML=`<span class="user-pill">${authUser.email} <span class="tier-badge ${t}">${t}</span>${usageText}</span>${t==='free'?'<button class="auth-btn primary" onclick="showAuth(\'upgrade\')" style="font-size:11px">Upgrade $9/mo</button>':''}<button class="auth-btn" onclick="doLogout()" style="font-size:10px">Log out</button>`;
+  // Beta mode: no auth UI changes needed
+  return;
 }
 
 function updateRepairButton(){
@@ -443,24 +436,8 @@ function updateRepairButton(){
   if(!S.hasIssues&&!S.repaired){btn.className='repair-btn download';return}
   if(S.repaired){
     btn.disabled=false;btn.className='repair-btn download';
-    bt.innerHTML='Download Print-Ready File';
+    bt.innerHTML='⬇ Download Print-Ready File';
     document.getElementById('fmtRow').style.display='flex';
-    return;
-  }
-  if(!authUser){
-    btn.disabled=false;btn.className='repair-btn analyze';
-    bt.innerHTML='🔒 Sign up to Repair & Download';
-    return;
-  }
-  if(authUser.tier==='free'){
-    btn.disabled=false;btn.className='repair-btn analyze';
-    bt.innerHTML='🔒 Upgrade to Maker to Repair';
-    return;
-  }
-  const u=authUser.usage||{used:0,limit:0};
-  if(u.used>=u.limit){
-    btn.disabled=true;btn.className='repair-btn analyze';
-    bt.innerHTML=`Limit reached — contact us`;
     return;
   }
   btn.disabled=false;btn.className='repair-btn analyze';
@@ -617,9 +594,41 @@ async function selectOrientation(idx){
 }
 
 // ═══ UPLOAD ═══
+// ═══ UPLOAD TIMER ═══
+let uploadTimer=null;
+const timerHints=[
+  {at:0, text:'Uploading your file...'},
+  {at:3, text:'Parsing mesh geometry...'},
+  {at:6, text:'Scanning 3D surface for print issues...'},
+  {at:10, text:'Mapping overhangs, thin walls & bridges...'},
+  {at:15, text:'Larger models take a bit longer — worth the wait'},
+  {at:25, text:'Running deep geometry analysis...'},
+  {at:40, text:'Almost there — complex meshes need extra care'},
+  {at:60, text:'Still working — this is a big file. Hang tight'},
+  {at:90, text:'Heavy lifting in progress...'},
+  {at:120, text:'This one\'s a beast. Still crunching...'}
+];
+function startUploadTimer(){
+  const start=Date.now();
+  const timerEl=document.getElementById('overlayTimer');
+  const hintEl=document.getElementById('overlayHint');
+  let lastHint=0;
+  uploadTimer=setInterval(()=>{
+    const elapsed=Math.floor((Date.now()-start)/1000);
+    const m=Math.floor(elapsed/60);
+    const s=elapsed%60;
+    timerEl.textContent=m>0?`${m}m ${s}s`:`${s}s`;
+    for(let i=timerHints.length-1;i>=0;i--){
+      if(elapsed>=timerHints[i].at&&i>=lastHint){hintEl.textContent=timerHints[i].text;lastHint=i+1;break}
+    }
+  },1000);
+}
+function stopUploadTimer(){if(uploadTimer){clearInterval(uploadTimer);uploadTimer=null}}
+
 async function uploadFile(file){
   const ov=document.getElementById('uploadOverlay');
   ov.classList.add('active');
+  startUploadTimer();
   document.getElementById('uploadZone').classList.add('hidden');
   document.getElementById('workspace').classList.add('active');
   initThree();
@@ -630,7 +639,7 @@ async function uploadFile(file){
     const form=new FormData();form.append('file',file);
     const r=await fetch('/api/upload',{method:'POST',body:form});
     const d=await r.json();
-    if(!r.ok){ov.classList.remove('active');showToast('❌ '+(d.error||'Upload failed'));return}
+    if(!r.ok){stopUploadTimer();ov.classList.remove('active');showToast('❌ '+(d.error||'Upload failed'));return}
     S.jobId=d.job_id;S.meshData=d.mesh_data;
     if(d.mesh_data){S.originalMesh=buildMesh(d.mesh_data,0xcc8855,true);S.scene.add(S.originalMesh)}
     renderStats(d.analysis.stats);renderIssues(d.analysis.issues);S.hasIssues=d.analysis.issues.length>0;
@@ -642,12 +651,12 @@ async function uploadFile(file){
     if(pr.ok&&pd.vertex_colors){S.heatmapData=pd;S.heatmapMesh=buildHeatmapMesh(d.mesh_data,pd.vertex_colors);S.heatmapMesh.visible=false;S.scene.add(S.heatmapMesh);renderPrintability(pd.printability)}
 
     // Dismiss overlay — core analysis is done, user can interact now
-    ov.classList.remove('active');
+    stopUploadTimer();ov.classList.remove('active');
     if(S.heatmapMesh){setTimeout(()=>switchView('heatmap'),300)}
 
     const btn=document.getElementById('repairBtn'),bt=document.getElementById('repairBtnText');
     btn.disabled=false;
-    if(S.hasIssues){updateRepairButton();document.getElementById('freeLabel').textContent='Free heatmap, orient & analysis — sign up to repair'}
+    if(S.hasIssues){updateRepairButton();document.getElementById('freeLabel').textContent='Free during beta — no account needed'}
     else{btn.className='repair-btn download';bt.innerHTML='⬇ Download Clean File';document.getElementById('freeLabel').textContent=''}
 
     // Run auto-orient in background (non-blocking) with timeout
@@ -668,18 +677,16 @@ async function uploadFile(file){
           if(od.orient){S.orientData=od.orient;renderOrientCards(od.orient.orientations);document.getElementById('orientStatus').textContent='Done'}
         }).catch(()=>{clearTimeout(orientTimeout);document.getElementById('orientStatus').textContent='Error'});
     }
-  }catch(e){ov.classList.remove('active');showToast('❌ '+e.message);console.error(e)}
+  }catch(e){stopUploadTimer();ov.classList.remove('active');showToast('❌ '+e.message);console.error(e)}
 }
 
 // ═══ REPAIR ═══
 let doRepair=async function(){}; // defined below after auth
 
 async function doDownload(){if(!S.jobId)return;
-  if(!authUser){showAuth('signup');return}
-  if(authUser.tier==='free'){showAuth('upgrade');return}
   const btn=document.getElementById('repairBtn');btn.disabled=true;document.getElementById('repairBtnText').innerHTML='<div class="spinner"></div> Downloading...';
   try{const fmt=S.downloadFormat||'stl';window.location.href=`/api/download/${S.jobId}?format=${fmt}`;showToast('📦 Downloading '+(fmt==='3mf'?'3MF':'STL')+'...')}catch(e){showToast('❌ '+e.message)}
-  btn.disabled=false;document.getElementById('repairBtnText').innerHTML='Download Print-Ready File';document.getElementById('fmtRow').style.display='flex'}
+  btn.disabled=false;document.getElementById('repairBtnText').innerHTML='⬇ Download Print-Ready File';document.getElementById('fmtRow').style.display='flex'}
 
 // ═══ EVENTS ═══
 const dz=document.getElementById('dropzone'),fi=document.getElementById('fileInput');
@@ -689,10 +696,6 @@ dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');if(e.dataTransfer.files.length)uploadFile(e.dataTransfer.files[0])});
 fi.addEventListener('change',e=>{if(e.target.files.length)uploadFile(e.target.files[0])});
 document.getElementById('repairBtn').addEventListener('click',()=>{
-  if(!authUser){showAuth('signup');return}
-  if(authUser.tier==='free'){showAuth('upgrade');return}
-  const u=authUser.usage||{used:0,limit:0};
-  if(u.used>=u.limit){showToast(`Monthly limit reached (${u.used}/${u.limit}). Contact us at hello@sliceready.co.`);return}
   if(!S.repaired&&S.hasIssues)doRepair();else if(S.repaired)doDownload()
 });
 document.querySelectorAll('#meshToggle .view-btn').forEach(b=>b.addEventListener('click',()=>switchView(b.dataset.view)));
@@ -915,12 +918,13 @@ async function submitFailure() {
 
   const ov = document.getElementById('uploadOverlay');
   ov.classList.add('active');
+  startUploadTimer();
   document.getElementById('overlayText').textContent = 'Loading analysis...';
 
   try {
     const r = await fetch(`/api/job/${jobId}`);
     const d = await r.json();
-    if (!r.ok) { ov.classList.remove('active'); showToast('❌ ' + (d.error || 'Failed to load')); return; }
+    if (!r.ok) { stopUploadTimer();ov.classList.remove('active'); showToast('❌ ' + (d.error || 'Failed to load')); return; }
 
     S.jobId = d.job_id;
     S.meshData = d.mesh_data;
@@ -938,12 +942,12 @@ async function submitFailure() {
     if (pr.ok && pd.vertex_colors) { S.heatmapData = pd; S.heatmapMesh = buildHeatmapMesh(d.mesh_data, pd.vertex_colors); S.heatmapMesh.visible = false; S.scene.add(S.heatmapMesh); renderPrintability(pd.printability); }
 
     // Dismiss overlay — core analysis is done
-    ov.classList.remove('active');
+    stopUploadTimer();ov.classList.remove('active');
     if(S.heatmapMesh){setTimeout(() => switchView('heatmap'), 300)}
 
     const btn = document.getElementById('repairBtn'), bt = document.getElementById('repairBtnText');
     btn.disabled = false;
-    if (S.hasIssues) { updateRepairButton(); document.getElementById('freeLabel').textContent = 'Free heatmap, orient & analysis'; }
+    if (S.hasIssues) { updateRepairButton(); document.getElementById('freeLabel').textContent = 'Free during beta — no account needed'; }
     else { btn.className = 'repair-btn download'; bt.innerHTML = '⬇ Download Clean File'; document.getElementById('freeLabel').textContent = ''; }
 
     // Orient in background (non-blocking)
@@ -964,7 +968,7 @@ async function submitFailure() {
           if(od.orient){S.orientData=od.orient;renderOrientCards(od.orient.orientations);document.getElementById('orientStatus').textContent='Done'}
         }).catch(()=>{clearTimeout(ot2);document.getElementById('orientStatus').textContent='Error'});
     }
-  } catch(e) { ov.classList.remove('active'); showToast('❌ ' + e.message); }
+  } catch(e) { stopUploadTimer();ov.classList.remove('active'); showToast('❌ ' + e.message); }
 })();
 
 </script>
