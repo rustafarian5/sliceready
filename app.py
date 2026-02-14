@@ -3221,9 +3221,6 @@ def download(job_id):
     if not mesh_path or not os.path.exists(mesh_path):
         return jsonify({'error': 'File not found on server'}), 404
 
-    output_format = request.args.get('format', 'stl').lower()
-    base_name = os.path.splitext(job.get('original_name', 'model'))[0]
-
     if output_format == '3mf':
         try:
             mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
