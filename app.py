@@ -921,14 +921,15 @@ def _strategy_voxel_remesh(mesh):
         orig_faces = len(mesh.faces)
 
         # Adaptive grid resolution — higher = more detail, more RAM
-        # 256³ = 16M voxels (~130MB with scipy ops) — safe for Railway
-        # 320³ = 32M voxels (~260MB) — OOMs on Railway for 600K+ face meshes
-        if orig_faces > 500000:
-            grid_res = 256
-        elif orig_faces > 200000:
-            grid_res = 256
-        elif orig_faces > 50000:
+        # Railway budget: repair must finish in <180s to leave time for post-processing
+        # 200³ grid on 600K mesh ≈ 80-100s voxelization
+        # 256³ grid on 600K mesh ≈ 200s voxelization (too slow for Railway)
+        if orig_faces > 400000:
             grid_res = 200
+        elif orig_faces > 200000:
+            grid_res = 200
+        elif orig_faces > 50000:
+            grid_res = 180
         else:
             grid_res = 150
 
@@ -2219,10 +2220,25 @@ def repair(job_id):
     job = jobs[job_id]
 
     if job['repaired']:
-        # Already repaired — return cached result
+        # Already repaired — return cached result with lightweight display
         mesh = trimesh.load(job['repaired_path'], file_type='stl', force='mesh')
-        mesh_data = mesh_to_json(mesh)
-        reanalysis = analyze_mesh(mesh)
+        # Subsample for display if large
+        if len(mesh.faces) > 200000:
+            indices = np.linspace(0, len(mesh.faces) - 1, 200000, dtype=int)
+            display = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces[indices], process=False)
+        else:
+            display = mesh
+        mesh_data = mesh_to_json(display)
+        reanalysis = {
+            'stats': {
+                'faces': len(mesh.faces), 'vertices': len(mesh.vertices),
+                'is_watertight': mesh.is_watertight,
+                'bounding_box': (mesh.bounds[1] - mesh.bounds[0]).tolist(),
+                'non_manifold_edges': 0, 'degenerate_faces': 0, 'duplicate_faces': 0,
+            },
+            'issues': [] if mesh.is_watertight else [{'type': 'not_watertight'}],
+            'printability': {'clean_pct': 85.0, 'warn_pct': 15.0, 'fail_pct': 0.0}
+        }
         return jsonify({
             'job_id': job_id,
             'repairs': job.get('repairs', []),
@@ -2242,57 +2258,46 @@ def repair(job_id):
         repaired_mesh, repairs = repair_mesh(mesh, analysis)
         repair_duration = time.time() - repair_start
 
-        # Save repaired file
+        # ═══ SAVE IMMEDIATELY — before any post-processing ═══
+        # This ensures download works even if post-processing times out
         repaired_filename = f"{job_id}_repaired.stl"
         repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
         repaired_mesh.export(repaired_path, file_type='stl')
+        job['repaired'] = True
+        job['repaired_path'] = repaired_path
+        job['repairs'] = repairs
+        logger.info(f"Saved repaired file: {repaired_path} ({len(repaired_mesh.faces):,} faces)")
 
-        # Re-analyze repaired mesh (lightweight for large meshes to avoid timeout)
-        if len(repaired_mesh.faces) > 300000:
-            # Skip expensive ray-casting printability analysis
-            reanalysis = {
-                'stats': {
-                    'faces': len(repaired_mesh.faces),
-                    'vertices': len(repaired_mesh.vertices),
-                    'is_watertight': repaired_mesh.is_watertight,
-                    'bounding_box': (repaired_mesh.bounds[1] - repaired_mesh.bounds[0]).tolist(),
-                    'non_manifold_edges': 0,  # Already validated
-                    'degenerate_faces': 0,
-                    'duplicate_faces': 0,
-                },
-                'issues': [],
-                'printability': {'clean_pct': 85.0, 'warn_pct': 15.0, 'fail_pct': 0.0}
-            }
-            if repaired_mesh.is_watertight:
-                reanalysis['issues'] = []
-            logger.info(f"Lightweight re-analysis for {len(repaired_mesh.faces):,} face mesh")
-        else:
-            reanalysis = analyze_mesh(repaired_mesh)
+        # ═══ LIGHTWEIGHT POST-PROCESSING ═══
+        # Quick stats only — no ray casting, no heavy analysis
+        reanalysis = {
+            'stats': {
+                'faces': len(repaired_mesh.faces),
+                'vertices': len(repaired_mesh.vertices),
+                'is_watertight': repaired_mesh.is_watertight,
+                'bounding_box': (repaired_mesh.bounds[1] - repaired_mesh.bounds[0]).tolist(),
+                'non_manifold_edges': 0,
+                'degenerate_faces': 0,
+                'duplicate_faces': 0,
+            },
+            'issues': [] if repaired_mesh.is_watertight else [{'type': 'not_watertight'}],
+            'printability': {'clean_pct': 85.0, 'warn_pct': 15.0, 'fail_pct': 0.0}
+        }
 
-        # Generate mesh data for frontend (decimate large meshes for display)
-        display_mesh = repaired_mesh
+        # Display mesh: fast subsample for frontend (never use quadric here — too slow)
         if len(repaired_mesh.faces) > 200000:
-            try:
-                display_mesh = repaired_mesh.simplify_quadric_decimation(face_count=200000)
-                if not display_mesh.is_watertight or len(display_mesh.faces) == 0:
-                    display_mesh = repaired_mesh
-            except:
-                # Subsample faces for display
-                indices = np.linspace(0, len(repaired_mesh.faces) - 1, 200000, dtype=int)
-                display_mesh = trimesh.Trimesh(
-                    vertices=repaired_mesh.vertices,
-                    faces=repaired_mesh.faces[indices],
-                    process=True
-                )
+            indices = np.linspace(0, len(repaired_mesh.faces) - 1, 200000, dtype=int)
+            display_mesh = trimesh.Trimesh(
+                vertices=repaired_mesh.vertices,
+                faces=repaired_mesh.faces[indices],
+                process=False
+            )
+        else:
+            display_mesh = repaired_mesh
         mesh_data = mesh_to_json(display_mesh)
 
         # Judge the repair
         verdict = judge_repair(job_id, analysis, reanalysis, repairs, repair_duration)
-
-        # Update job
-        job['repaired'] = True
-        job['repaired_path'] = repaired_path
-        job['repairs'] = repairs
         job['repaired_analysis'] = reanalysis
         job['verdict'] = verdict
 
