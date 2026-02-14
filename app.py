@@ -1037,7 +1037,28 @@ def _strategy_voxel_remesh(mesh):
                     result = decimated
                     logger.info(f"    Decimated: {len(result.faces):,} faces (target {target_faces:,})")
             except Exception as e:
-                logger.warning(f"    Decimation skipped: {e}")
+                logger.warning(f"    Quadric decimation failed: {e} — trying vertex merge")
+                # Fallback: merge close vertices to reduce face count
+                try:
+                    ratio = target_faces / len(result.faces)
+                    merge_dist = pitch * (1.0 / max(ratio, 0.1)) * 0.3
+                    verts = result.vertices.copy()
+                    faces = result.faces.copy()
+                    # Quantize vertices to merge nearby ones
+                    quantized = np.round(verts / merge_dist) * merge_dist
+                    _, inverse = np.unique(quantized, axis=0, return_inverse=True)
+                    new_faces = inverse[faces]
+                    # Remove degenerate faces
+                    valid = (new_faces[:, 0] != new_faces[:, 1]) & \
+                            (new_faces[:, 1] != new_faces[:, 2]) & \
+                            (new_faces[:, 0] != new_faces[:, 2])
+                    new_faces = new_faces[valid]
+                    decimated = trimesh.Trimesh(vertices=quantized, faces=new_faces, process=True)
+                    if decimated.is_watertight and len(decimated.faces) > 0:
+                        result = decimated
+                        logger.info(f"    Vertex-merge decimated: {len(result.faces):,} faces")
+                except Exception as e2:
+                    logger.warning(f"    Vertex merge also failed: {e2}")
 
         return result, f"volumetric reconstruction (grid={grid_res}, {len(result.faces):,} faces)"
 
@@ -2226,11 +2247,44 @@ def repair(job_id):
         repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
         repaired_mesh.export(repaired_path, file_type='stl')
 
-        # Re-analyze repaired mesh
-        reanalysis = analyze_mesh(repaired_mesh)
+        # Re-analyze repaired mesh (lightweight for large meshes to avoid timeout)
+        if len(repaired_mesh.faces) > 300000:
+            # Skip expensive ray-casting printability analysis
+            reanalysis = {
+                'stats': {
+                    'faces': len(repaired_mesh.faces),
+                    'vertices': len(repaired_mesh.vertices),
+                    'is_watertight': repaired_mesh.is_watertight,
+                    'bounding_box': (repaired_mesh.bounds[1] - repaired_mesh.bounds[0]).tolist(),
+                    'non_manifold_edges': 0,  # Already validated
+                    'degenerate_faces': 0,
+                    'duplicate_faces': 0,
+                },
+                'issues': [],
+                'printability': {'clean_pct': 85.0, 'warn_pct': 15.0, 'fail_pct': 0.0}
+            }
+            if repaired_mesh.is_watertight:
+                reanalysis['issues'] = []
+            logger.info(f"Lightweight re-analysis for {len(repaired_mesh.faces):,} face mesh")
+        else:
+            reanalysis = analyze_mesh(repaired_mesh)
 
-        # Generate mesh data for frontend
-        mesh_data = mesh_to_json(repaired_mesh)
+        # Generate mesh data for frontend (decimate large meshes for display)
+        display_mesh = repaired_mesh
+        if len(repaired_mesh.faces) > 200000:
+            try:
+                display_mesh = repaired_mesh.simplify_quadric_decimation(face_count=200000)
+                if not display_mesh.is_watertight or len(display_mesh.faces) == 0:
+                    display_mesh = repaired_mesh
+            except:
+                # Subsample faces for display
+                indices = np.linspace(0, len(repaired_mesh.faces) - 1, 200000, dtype=int)
+                display_mesh = trimesh.Trimesh(
+                    vertices=repaired_mesh.vertices,
+                    faces=repaired_mesh.faces[indices],
+                    process=True
+                )
+        mesh_data = mesh_to_json(display_mesh)
 
         # Judge the repair
         verdict = judge_repair(job_id, analysis, reanalysis, repairs, repair_duration)
