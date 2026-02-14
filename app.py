@@ -920,16 +920,13 @@ def _strategy_voxel_remesh(mesh):
 
         orig_faces = len(mesh.faces)
 
-        # Adaptive grid resolution — higher = more detail, more RAM
-        # Railway budget: repair must finish in <180s to leave time for post-processing
-        # 200³ grid on 600K mesh ≈ 80-100s voxelization
-        # 256³ grid on 600K mesh ≈ 200s voxelization (too slow for Railway)
-        if orig_faces > 400000:
-            grid_res = 200
-        elif orig_faces > 200000:
-            grid_res = 200
+        # Adaptive grid resolution
+        # /fix endpoint has no heavy post-processing, timeout is 600s
+        # 256 grid on 610K mesh ≈ 268s total — fits within budget
+        if orig_faces > 200000:
+            grid_res = 256
         elif orig_faces > 50000:
-            grid_res = 180
+            grid_res = 200
         else:
             grid_res = 150
 
@@ -971,9 +968,10 @@ def _strategy_voxel_remesh(mesh):
 
         result = trimesh.Trimesh(vertices=verts_mc, faces=faces_mc, process=True)
 
-        # Step 7: Smooth stair-stepping
+        # Step 7: Smooth stair-stepping (Taubin-style: smooth then inflate back)
         try:
-            trimesh.smoothing.filter_laplacian(result, iterations=2, lamb=0.15)
+            trimesh.smoothing.filter_laplacian(result, iterations=5, lamb=0.5)
+            trimesh.smoothing.filter_laplacian(result, iterations=3, lamb=-0.3)
         except:
             pass
 
