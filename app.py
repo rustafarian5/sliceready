@@ -2056,6 +2056,253 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/fix')
+def fix_page():
+    """Dead-simple one-page repair: upload → auto-repair → download."""
+    return '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SliceReady — Fix Your STL</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.logo { font-size: 1.4rem; font-weight: 700; margin-bottom: 2rem; }
+.logo span { color: #22c55e; }
+#dropzone { width: 500px; max-width: 90vw; border: 2px dashed #333; border-radius: 16px; padding: 60px 40px; text-align: center; cursor: pointer; transition: all 0.2s; }
+#dropzone:hover, #dropzone.drag { border-color: #22c55e; background: rgba(34,197,94,0.05); }
+#dropzone h2 { font-size: 1.3rem; margin-bottom: 0.5rem; }
+#dropzone p { color: #888; font-size: 0.9rem; }
+#dropzone input { display: none; }
+#status { width: 500px; max-width: 90vw; margin-top: 2rem; text-align: center; display: none; }
+#status .msg { font-size: 1.1rem; margin-bottom: 1rem; }
+#status .sub { color: #888; font-size: 0.85rem; margin-bottom: 1.5rem; }
+.spinner { display: inline-block; width: 24px; height: 24px; border: 3px solid #333; border-top-color: #22c55e; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#download-btn { display: none; background: #22c55e; color: #000; font-weight: 700; font-size: 1.1rem; padding: 16px 48px; border: none; border-radius: 10px; cursor: pointer; transition: background 0.2s; }
+#download-btn:hover { background: #16a34a; }
+#error { color: #ef4444; margin-top: 1rem; display: none; }
+#repairs { color: #888; font-size: 0.8rem; margin-top: 1rem; text-align: left; max-width: 500px; }
+#repairs li { margin-bottom: 2px; }
+.reset { color: #888; font-size: 0.85rem; margin-top: 1.5rem; cursor: pointer; text-decoration: underline; }
+.reset:hover { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div class="logo">Slice<span>Ready</span></div>
+
+<div id="dropzone" onclick="document.getElementById('fileinput').click()">
+  <input type="file" id="fileinput" accept=".stl">
+  <h2>Drop your STL file here</h2>
+  <p>or click to browse — repairs start automatically</p>
+</div>
+
+<div id="status">
+  <div class="msg" id="msg"></div>
+  <div class="sub" id="sub"></div>
+  <button id="download-btn" onclick="downloadFile()">Download Repaired STL</button>
+  <div id="error"></div>
+  <ul id="repairs"></ul>
+  <div class="reset" id="reset-link" style="display:none" onclick="location.reload()">↻ Fix another file</div>
+</div>
+
+<script>
+let jobId = null;
+
+const dz = document.getElementById('dropzone');
+const fi = document.getElementById('fileinput');
+const status = document.getElementById('status');
+const msg = document.getElementById('msg');
+const sub = document.getElementById('sub');
+const dlBtn = document.getElementById('download-btn');
+const errDiv = document.getElementById('error');
+const repairsList = document.getElementById('repairs');
+const resetLink = document.getElementById('reset-link');
+
+// Drag and drop
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('drag'); if(e.dataTransfer.files[0]) startFix(e.dataTransfer.files[0]); });
+fi.addEventListener('change', () => { if(fi.files[0]) startFix(fi.files[0]); });
+
+async function startFix(file) {
+  if(!file.name.toLowerCase().endsWith('.stl')) { showError('Only .stl files supported'); return; }
+
+  dz.style.display = 'none';
+  status.style.display = 'block';
+  dlBtn.style.display = 'none';
+  errDiv.style.display = 'none';
+  repairsList.innerHTML = '';
+  resetLink.style.display = 'none';
+
+  // Step 1: Upload
+  msg.innerHTML = '<span class="spinner"></span> Uploading & repairing...';
+  sub.textContent = file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB) — this can take 1-2 minutes for large files';
+
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const upRes = await fetch('/api/quick-fix', { method: 'POST', body: form });
+
+    if(!upRes.ok) {
+      const err = await upRes.json();
+      throw new Error(err.error || 'Upload failed');
+    }
+
+    const data = await upRes.json();
+    jobId = data.job_id;
+
+    if(data.already_clean) {
+      msg.textContent = '✓ Mesh is already clean — no repair needed';
+      sub.textContent = data.faces.toLocaleString() + ' faces, watertight';
+      dlBtn.style.display = 'inline-block';
+      dlBtn.textContent = 'Download STL';
+      resetLink.style.display = 'block';
+      return;
+    }
+
+    // Show results
+    msg.textContent = '✓ Repair complete';
+    sub.textContent = data.faces.toLocaleString() + ' faces — watertight: ' + (data.watertight ? 'Yes' : 'No') + ' — ' + data.time.toFixed(0) + 's';
+    dlBtn.style.display = 'inline-block';
+    resetLink.style.display = 'block';
+
+    if(data.repairs) {
+      data.repairs.forEach(r => {
+        const li = document.createElement('li');
+        li.textContent = r;
+        repairsList.appendChild(li);
+      });
+    }
+
+  } catch(e) {
+    showError(e.message);
+    resetLink.style.display = 'block';
+  }
+}
+
+function showError(text) {
+  msg.innerHTML = '';
+  errDiv.textContent = '✗ ' + text;
+  errDiv.style.display = 'block';
+}
+
+function downloadFile() {
+  if(jobId) window.location.href = '/api/download/' + jobId;
+}
+</script>
+</body>
+</html>'''
+
+
+@app.route('/api/quick-fix', methods=['POST'])
+def quick_fix():
+    """Combined upload + repair in one request. No visualization, no heavy analysis."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['file']
+    if not file.filename.lower().endswith('.stl'):
+        return jsonify({'error': 'Only STL files are supported'}), 400
+
+    # Save file
+    job_id = str(uuid.uuid4())[:12]
+    filename = f"{job_id}.stl"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+    file_size = os.path.getsize(filepath)
+    logger.info(f"QuickFix upload: {file.filename} ({file_size/1024/1024:.2f}MB) → {job_id}")
+
+    try:
+        mesh = trimesh.load(filepath, file_type='stl', force='mesh')
+        if mesh is None or len(mesh.faces) == 0:
+            return jsonify({'error': 'No geometry found in STL file'}), 400
+
+        # Quick analysis — just the stats repair_mesh needs, skip ray casting
+        stats = {
+            'is_watertight': bool(mesh.is_watertight),
+            'degenerate_faces': int(np.sum(mesh.area_faces < 1e-10)),
+            'non_manifold_edges': 0,
+            'duplicate_faces': 0,
+            'triangles': len(mesh.faces),
+            'vertices': len(mesh.vertices),
+        }
+
+        # Non-manifold edges (fast numpy)
+        edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+        edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+        _, edge_counts = np.unique(edge_keys, return_counts=True)
+        stats['non_manifold_edges'] = int(np.sum(edge_counts != 2))
+
+        # Duplicate faces
+        face_sorted = np.sort(mesh.faces, axis=1)
+        _, face_counts = np.unique(face_sorted, axis=0, return_counts=True)
+        stats['duplicate_faces'] = int(np.sum(face_counts > 1))
+
+        analysis = {'stats': stats, 'issues': []}
+        if stats['non_manifold_edges'] > 0:
+            analysis['issues'].append({'type': 'error', 'title': 'Non-manifold edges', 'desc': f"{stats['non_manifold_edges']} nm edges", 'severity': 3})
+        if not stats['is_watertight']:
+            analysis['issues'].append({'type': 'error', 'title': 'Not watertight', 'desc': 'Open boundaries', 'severity': 3})
+
+        # Store job
+        jobs[job_id] = {
+            'original_path': filepath,
+            'original_filename': file.filename,
+            'original_name': file.filename,
+            'file_size': file_size,
+            'analysis': analysis,
+            'repaired': False,
+            'repaired_path': None,
+            'created_at': datetime.utcnow().isoformat(),
+            'paid': False
+        }
+
+        # Check if already clean
+        is_clean = (stats['is_watertight'] and stats['degenerate_faces'] == 0
+                    and stats['duplicate_faces'] == 0 and stats['non_manifold_edges'] == 0)
+        if is_clean:
+            jobs[job_id]['repaired'] = True
+            jobs[job_id]['repaired_path'] = filepath  # Original is fine
+            return jsonify({
+                'job_id': job_id,
+                'already_clean': True,
+                'faces': len(mesh.faces),
+                'watertight': True,
+                'repairs': ['Mesh is already clean — no repair needed'],
+                'time': 0
+            })
+
+        # Run repair
+        logger.info(f"QuickFix repairing {job_id}: {len(mesh.faces):,} faces, {len(analysis['issues'])} issues")
+        repair_start = time.time()
+        repaired_mesh, repairs = repair_mesh(mesh, analysis)
+        repair_duration = time.time() - repair_start
+
+        # Save immediately
+        repaired_filename = f"{job_id}_repaired.stl"
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], repaired_filename)
+        repaired_mesh.export(repaired_path, file_type='stl')
+        jobs[job_id]['repaired'] = True
+        jobs[job_id]['repaired_path'] = repaired_path
+        jobs[job_id]['repairs'] = repairs
+        logger.info(f"QuickFix done: {job_id} — {len(repaired_mesh.faces):,} faces, wt={repaired_mesh.is_watertight}, {repair_duration:.1f}s")
+
+        return jsonify({
+            'job_id': job_id,
+            'already_clean': False,
+            'faces': len(repaired_mesh.faces),
+            'watertight': bool(repaired_mesh.is_watertight),
+            'repairs': repairs,
+            'time': round(repair_duration, 1)
+        })
+
+    except Exception as e:
+        logger.error(f"QuickFix failed for {job_id}: {e}")
+        return jsonify({'error': f'Repair failed: {str(e)}'}), 500
+
+
 @app.route('/app')
 def workspace():
     return render_template('workspace.html')
