@@ -893,115 +893,109 @@ def _strategy_surgical_repair(mesh):
     """
     Strategy S: Surgical Non-Manifold Repair.
     
-    Instead of rebuilding the entire mesh (voxel) or brute-forcing (pymeshfix),
-    this surgically fixes non-manifold edges by removing ONLY the extra faces
-    that cause the edge to be shared by >2 faces, then uses pymeshfix to fill
-    any remaining small holes.
-    
-    For a 614K face mesh with 4,763 bad edges, this removes ~1-2% of faces
-    and preserves 98%+ of original detail.
+    For a 614K face mesh with 4,763 bad edges (~0.5% of edges):
+    1. Find edges shared by >2 faces, remove only the EXTRA faces
+    2. Iteratively fix remaining nm edges (some appear after first pass)
+    3. Try multiple paths to make watertight: manifold3d → fill_holes → pymeshfix
+    4. If nothing makes it watertight, return the cleaned mesh anyway
+       (preserving 98% of detail is better than voxel destroying 100%)
     """
     try:
         verts = mesh.vertices.copy()
         faces = mesh.faces.copy()
         n_faces_orig = len(faces)
-        
-        # Step 1: Find non-manifold edges (edges shared by != 2 faces)
-        # Build edge-to-face mapping
         n_verts = len(verts)
-        # For each face, compute its 3 sorted edge keys
-        sf = np.sort(faces, axis=1)
-        ek0 = sf[:, 0] * (n_verts + 1) + sf[:, 1]
-        ek1 = sf[:, 1] * (n_verts + 1) + sf[:, 2]
-        ek2 = sf[:, 0] * (n_verts + 1) + sf[:, 2]
         
-        # Stack all edge keys with face indices
-        all_ek = np.concatenate([ek0, ek1, ek2])
-        all_fi = np.concatenate([np.arange(len(faces))] * 3)
+        def _count_nm_edges(f):
+            """Count non-manifold edges in a face array."""
+            sf = np.sort(f, axis=1)
+            ek0 = sf[:, 0] * (n_verts + 1) + sf[:, 1]
+            ek1 = sf[:, 1] * (n_verts + 1) + sf[:, 2]
+            ek2 = sf[:, 0] * (n_verts + 1) + sf[:, 2]
+            all_ek = np.concatenate([ek0, ek1, ek2])
+            _, counts = np.unique(all_ek, return_counts=True)
+            return int(np.sum(counts != 2))
         
-        # Find unique edges and their counts
-        unique_ek, inv, counts = np.unique(all_ek, return_inverse=True, return_counts=True)
+        def _remove_extra_faces(verts_in, faces_in):
+            """Remove extra faces on non-manifold edges, keeping 2 largest per edge."""
+            face_areas = trimesh.Trimesh(vertices=verts_in, faces=faces_in, process=False).area_faces
+            sf = np.sort(faces_in, axis=1)
+            nv = len(verts_in)
+            ek0 = sf[:, 0] * (nv + 1) + sf[:, 1]
+            ek1 = sf[:, 1] * (nv + 1) + sf[:, 2]
+            ek2 = sf[:, 0] * (nv + 1) + sf[:, 2]
+            all_ek = np.concatenate([ek0, ek1, ek2])
+            all_fi = np.concatenate([np.arange(len(faces_in))] * 3)
+            unique_ek, inv, counts = np.unique(all_ek, return_inverse=True, return_counts=True)
+            bad_ek_set = set(unique_ek[counts > 2].tolist())  # Only >2 (excess faces)
+            
+            if len(bad_ek_set) == 0:
+                return faces_in, 0
+            
+            edge_to_faces = {}
+            for idx in range(len(all_ek)):
+                ek_val = all_ek[idx]
+                if ek_val in bad_ek_set:
+                    fi = all_fi[idx]
+                    if ek_val not in edge_to_faces:
+                        edge_to_faces[ek_val] = []
+                    edge_to_faces[ek_val].append(fi)
+            
+            faces_to_remove = set()
+            for ek_val, face_list in edge_to_faces.items():
+                if len(face_list) > 2:
+                    areas = [(face_areas[fi], fi) for fi in face_list]
+                    areas.sort(reverse=True)
+                    for _, fi in areas[2:]:
+                        faces_to_remove.add(fi)
+            
+            if len(faces_to_remove) == 0:
+                return faces_in, 0
+            
+            keep_mask = np.ones(len(faces_in), dtype=bool)
+            for fi in faces_to_remove:
+                keep_mask[fi] = False
+            return faces_in[keep_mask], len(faces_to_remove)
         
-        # Edges with count != 2 are non-manifold
-        bad_edge_mask = counts != 2
-        n_bad_edges = int(bad_edge_mask.sum())
+        # ──────────────────────────────────────
+        # STEP 1: Iterative removal of extra faces
+        # Some nm edges only appear after other extras are removed
+        # ──────────────────────────────────────
+        total_removed = 0
+        current_faces = faces
+        for iteration in range(5):  # Max 5 passes
+            nm_before = _count_nm_edges(current_faces)
+            if nm_before == 0:
+                break
+            
+            current_faces, n_removed = _remove_extra_faces(verts, current_faces)
+            total_removed += n_removed
+            nm_after = _count_nm_edges(current_faces)
+            
+            logger.info(f"    Surgical pass {iteration+1}: removed {n_removed} extra faces, "
+                        f"nm edges {nm_before} → {nm_after}")
+            
+            if n_removed == 0 or nm_after == 0:
+                break
         
-        if n_bad_edges == 0:
-            return None, "no non-manifold edges found"
+        removal_pct = total_removed / n_faces_orig * 100
+        logger.info(f"    Surgical total: removed {total_removed} faces ({removal_pct:.1f}%), "
+                    f"nm edges: {_count_nm_edges(faces)} → {_count_nm_edges(current_faces)}")
         
-        # Step 2: For edges with >2 faces, mark EXTRA faces for removal
-        # For each bad edge, keep the 2 largest faces (by area), remove the rest
-        face_areas = mesh.area_faces
-        faces_to_remove = set()
+        if removal_pct > 20:
+            return None, f"too many faces removed ({removal_pct:.1f}%) — not surgical"
         
-        # Get bad edge keys
-        bad_ek_set = set(unique_ek[bad_edge_mask].tolist())
+        # Build the cleaned mesh
+        cleaned = trimesh.Trimesh(vertices=verts, faces=current_faces, process=True)
+        remaining_nm = _count_nm_edges(cleaned.faces)
         
-        # Build edge→faces mapping for bad edges only
-        edge_to_faces = {}
-        for idx in range(len(all_ek)):
-            ek_val = all_ek[idx]
-            if ek_val in bad_ek_set:
-                fi = all_fi[idx]
-                if ek_val not in edge_to_faces:
-                    edge_to_faces[ek_val] = []
-                edge_to_faces[ek_val].append(fi)
+        # ──────────────────────────────────────
+        # STEP 2: Try to make it watertight via multiple paths
+        # ──────────────────────────────────────
         
-        for ek_val, face_list in edge_to_faces.items():
-            n = len(face_list)
-            if n > 2:
-                # Keep the 2 faces with largest area, remove the rest
-                areas = [(face_areas[fi], fi) for fi in face_list]
-                areas.sort(reverse=True)
-                for _, fi in areas[2:]:
-                    faces_to_remove.add(fi)
-            elif n == 1:
-                # Open edge — don't remove, let pymeshfix fill
-                pass
-            # n == 0 shouldn't happen
-        
-        n_removing = len(faces_to_remove)
-        removal_pct = n_removing / n_faces_orig * 100
-        
-        logger.info(f"    Surgical: {n_bad_edges} bad edges, removing {n_removing} extra faces ({removal_pct:.1f}%)")
-        
-        if removal_pct > 15:
-            return None, f"too many faces to remove ({removal_pct:.1f}%) — not surgical"
-        
-        if n_removing == 0:
-            # All bad edges are open boundaries (1 face), not excess faces
-            # Try pymeshfix directly on the mesh
-            logger.info(f"    Surgical: all bad edges are open boundaries, trying pymeshfix directly")
-            try:
-                fixer = pymeshfix.MeshFix(
-                    np.array(verts, dtype=np.float64),
-                    np.array(faces, dtype=np.int32)
-                )
-                fixer.repair()
-                result = trimesh.Trimesh(
-                    vertices=np.array(fixer.points),
-                    faces=np.array(fixer.faces),
-                    process=True
-                )
-                if result.is_watertight and len(result.faces) >= n_faces_orig * 0.70:
-                    return result, f"surgical: pymeshfix hole-fill on open boundaries ({len(result.faces):,} faces)"
-                else:
-                    return None, f"pymeshfix couldn't fix open boundaries cleanly"
-            except Exception as e:
-                return None, f"pymeshfix failed on open boundaries: {e}"
-        
-        # Step 3: Remove only the extra faces
-        keep_mask = np.ones(len(faces), dtype=bool)
-        for fi in faces_to_remove:
-            keep_mask[fi] = False
-        
-        cleaned_faces = faces[keep_mask]
-        cleaned = trimesh.Trimesh(vertices=verts, faces=cleaned_faces, process=True)
-        
-        logger.info(f"    Surgical: {n_faces_orig:,} → {len(cleaned.faces):,} faces after removing extras")
-        
-        # Step 4: Check if removal alone fixed it
+        # PATH A: Already watertight after removal? Validate with manifold3d
         if cleaned.is_watertight:
+            logger.info(f"    Surgical: watertight after removal! Trying manifold3d...")
             try:
                 mm = manifold3d.Mesh(
                     vert_properties=np.array(cleaned.vertices, dtype=np.float64),
@@ -1015,53 +1009,99 @@ def _strategy_surgical_repair(mesh):
                         faces=np.array(out.tri_verts),
                         process=True
                     )
-                    return result, f"surgical: removed {n_removing} extra faces, manifold-validated ({len(result.faces):,} faces)"
+                    return result, (f"surgical: removed {total_removed} extra faces, "
+                                    f"manifold-validated ({len(result.faces):,} faces)")
             except:
                 pass
-            return cleaned, f"surgical: removed {n_removing} extra faces, watertight ({len(cleaned.faces):,} faces)"
+            # Watertight but manifold3d rejected — still good
+            return cleaned, (f"surgical: removed {total_removed} extra faces, "
+                            f"watertight ({len(cleaned.faces):,} faces)")
         
-        # Step 5: Not watertight yet — pymeshfix to fill remaining holes
+        # PATH B: Not watertight. Try trimesh built-in repairs first (fast, non-destructive)
+        logger.info(f"    Surgical: not watertight ({remaining_nm} nm edges remain). Trying trimesh repairs...")
+        repaired = trimesh.Trimesh(
+            vertices=cleaned.vertices.copy(), faces=cleaned.faces.copy(), process=False
+        )
+        try:
+            trimesh.repair.fix_normals(repaired)
+            trimesh.repair.fix_inversion(repaired)
+            trimesh.repair.fill_holes(repaired)
+            repaired.process()
+        except Exception as e:
+            logger.warning(f"    Surgical: trimesh repair failed: {e}")
+        
+        if repaired.is_watertight:
+            logger.info(f"    Surgical: watertight after trimesh repairs!")
+            try:
+                mm = manifold3d.Mesh(
+                    vert_properties=np.array(repaired.vertices, dtype=np.float64),
+                    tri_verts=np.array(repaired.faces, dtype=np.uint32)
+                )
+                mf = manifold3d.Manifold(mm)
+                if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                    out = mf.to_mesh()
+                    result = trimesh.Trimesh(
+                        vertices=np.array(out.vert_properties)[:, :3],
+                        faces=np.array(out.tri_verts),
+                        process=True
+                    )
+                    return result, (f"surgical: removed {total_removed} faces + trimesh repair, "
+                                    f"manifold-validated ({len(result.faces):,} faces)")
+            except:
+                pass
+            return repaired, (f"surgical: removed {total_removed} faces + trimesh repair, "
+                             f"watertight ({len(repaired.faces):,} faces)")
+        
+        # PATH C: pymeshfix on the surgically cleaned mesh
+        # pymeshfix should work better on mostly-clean mesh than on raw broken mesh
+        logger.info(f"    Surgical: trying pymeshfix on cleaned mesh ({len(cleaned.faces):,} faces)...")
         try:
             fixer = pymeshfix.MeshFix(
                 np.array(cleaned.vertices, dtype=np.float64),
                 np.array(cleaned.faces, dtype=np.int32)
             )
             fixer.repair()
-            result = trimesh.Trimesh(
+            pmf_result = trimesh.Trimesh(
                 vertices=np.array(fixer.points),
                 faces=np.array(fixer.faces),
                 process=True
             )
+            
+            retention = len(pmf_result.faces) / n_faces_orig
+            logger.info(f"    Surgical+pymeshfix: {len(pmf_result.faces):,} faces "
+                        f"({retention:.0%}), wt={pmf_result.is_watertight}")
+            
+            if pmf_result.is_watertight and retention >= 0.50:
+                # Try manifold3d validation
+                try:
+                    mm = manifold3d.Mesh(
+                        vert_properties=np.array(pmf_result.vertices, dtype=np.float64),
+                        tri_verts=np.array(pmf_result.faces, dtype=np.uint32)
+                    )
+                    mf = manifold3d.Manifold(mm)
+                    if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                        out = mf.to_mesh()
+                        pmf_result = trimesh.Trimesh(
+                            vertices=np.array(out.vert_properties)[:, :3],
+                            faces=np.array(out.tri_verts),
+                            process=True
+                        )
+                except:
+                    pass
+                
+                return pmf_result, (f"surgical+pymeshfix: removed {total_removed} extras, "
+                                    f"pymeshfix filled holes ({len(pmf_result.faces):,} faces, "
+                                    f"{retention:.0%} retained)")
         except Exception as e:
-            return None, f"pymeshfix hole-fill failed: {e}"
+            logger.warning(f"    Surgical+pymeshfix failed: {e}")
         
-        # Step 6: Check pymeshfix didn't destroy geometry
-        retention = len(result.faces) / n_faces_orig
-        if retention < 0.50:
-            logger.warning(f"    Surgical: pymeshfix destroyed geometry ({retention:.0%} retained)")
-            return None, f"pymeshfix destroyed geometry after surgical removal ({retention:.0%})"
-        
-        if not result.is_watertight:
-            return None, "not watertight after surgical repair + pymeshfix"
-        
-        # Step 7: Manifold validation
-        try:
-            mm = manifold3d.Mesh(
-                vert_properties=np.array(result.vertices, dtype=np.float64),
-                tri_verts=np.array(result.faces, dtype=np.uint32)
-            )
-            mf = manifold3d.Manifold(mm)
-            if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
-                out = mf.to_mesh()
-                result = trimesh.Trimesh(
-                    vertices=np.array(out.vert_properties)[:, :3],
-                    faces=np.array(out.tri_verts),
-                    process=True
-                )
-        except:
-            pass
-        
-        return result, f"surgical: removed {n_removing} extra faces, filled holes ({len(result.faces):,} faces, {retention:.0%} retained)"
+        # PATH D: Nothing made it watertight. Return the surgically cleaned mesh anyway.
+        # 98% of original detail, non-watertight is still WAY better than voxel garbage.
+        # Most slicers (Bambu, PrusaSlicer, Cura) can handle minor non-manifold issues.
+        logger.info(f"    Surgical: returning non-watertight result ({len(cleaned.faces):,} faces, "
+                    f"{remaining_nm} nm edges) — better than voxel destruction")
+        return cleaned, (f"surgical: removed {total_removed} extra faces, {remaining_nm} nm edges remain "
+                        f"({len(cleaned.faces):,} faces, {100 - removal_pct:.1f}% preserved)")
     
     except Exception as e:
         return None, f"surgical repair failed: {e}"
@@ -1457,12 +1497,38 @@ def repair_mesh(mesh, analysis):
                 logger.info(f"  [{_elapsed():.1f}s] Large broken mesh ({len(safe_faces):,} faces, {nm_count} nm) — trying surgical repair...")
                 surgical_score = _try_strategy("surgical", _strategy_surgical_repair)
                 
-                if surgical_score >= 70:
-                    logger.info(f"  [{_elapsed():.1f}s] Surgical scored {surgical_score} — skipping voxel and pymeshfix")
-                    skip_pymeshfix = True
+                # Check if surgical produced a high-retention result
+                surgical_result = None
+                for score, mesh_r, name, desc in results:
+                    if name == "surgical":
+                        surgical_result = (score, mesh_r, name, desc)
+                        break
+                
+                if surgical_result:
+                    sr_faces = len(surgical_result[1].faces)
+                    sr_retention = sr_faces / len(safe_faces)
+                    sr_watertight = surgical_result[1].is_watertight
+                    
+                    if sr_retention >= 0.85:
+                        # High retention surgical result — skip voxel entirely.
+                        # Even a non-watertight mesh with 98% original detail 
+                        # is better than a watertight voxel that looks like minecraft.
+                        # Most slicers can handle minor issues.
+                        logger.info(f"  [{_elapsed():.1f}s] Surgical kept {sr_retention:.0%} of faces "
+                                    f"(wt={sr_watertight}) — skipping voxel and pymeshfix")
+                        skip_pymeshfix = True
+                    elif surgical_score >= 70:
+                        logger.info(f"  [{_elapsed():.1f}s] Surgical scored {surgical_score} — skipping voxel")
+                        skip_pymeshfix = True
+                    else:
+                        # Surgical didn't preserve enough — fall back to volumetric
+                        logger.info(f"  [{_elapsed():.1f}s] Surgical: {sr_retention:.0%} retention, score {surgical_score} — trying voxel fallback...")
+                        voxel_score = _try_strategy("voxel_reconstruct", _strategy_voxel_remesh, volumetric=True)
+                        if voxel_score >= 60:
+                            skip_pymeshfix = True
                 else:
-                    # Surgical failed or scored low — fall back to volumetric reconstruction
-                    logger.info(f"  [{_elapsed():.1f}s] Surgical scored {surgical_score} — trying volumetric reconstruction...")
+                    # Surgical failed entirely — fall back to voxel
+                    logger.info(f"  [{_elapsed():.1f}s] Surgical failed — trying voxel fallback...")
                     voxel_score = _try_strategy("voxel_reconstruct", _strategy_voxel_remesh, volumetric=True)
                     if voxel_score >= 60:
                         logger.info(f"  [{_elapsed():.1f}s] Voxel scored {voxel_score} — skipping pymeshfix")
@@ -2349,7 +2415,11 @@ async function startFix(file) {
 
     // Show results
     msg.textContent = '✓ Repair complete';
-    sub.textContent = data.faces.toLocaleString() + ' faces — watertight: ' + (data.watertight ? 'Yes' : 'No') + ' — ' + data.time.toFixed(0) + 's';
+    let detail = data.faces.toLocaleString() + ' faces';
+    if(data.original_faces && data.original_faces !== data.faces) {
+      detail = data.original_faces.toLocaleString() + ' → ' + data.faces.toLocaleString() + ' faces';
+    }
+    sub.textContent = detail + ' — watertight: ' + (data.watertight ? 'Yes' : 'No') + ' — ' + data.time.toFixed(0) + 's';
     dlBtn.style.display = 'inline-block';
     resetLink.style.display = 'block';
 
@@ -2477,6 +2547,7 @@ def quick_fix():
         return jsonify({
             'job_id': job_id,
             'already_clean': False,
+            'original_faces': len(mesh.faces),
             'faces': len(repaired_mesh.faces),
             'watertight': bool(repaired_mesh.is_watertight),
             'repairs': repairs,
