@@ -508,14 +508,16 @@ def _timeout_handler(signum, frame):
     raise RepairTimeout("Repair hit hard time ceiling")
 
 
-def _score_result(result_mesh, original_mesh):
+def _score_result(result_mesh, original_mesh, volumetric=False):
     """
     Score a repair result 0-100.
     Higher = better.
 
-    CRITICAL RULE: A result that loses >40% of faces is REJECTED regardless
-    of watertight status. A watertight mesh missing half the model is worse
-    than a complete mesh with holes.
+    volumetric=True: for voxel/reconstruction strategies that rebuild the shape
+    from scratch. Face count is meaningless — only shape preservation matters.
+
+    CRITICAL RULE (topology mode): A result that loses >40% of faces is REJECTED.
+    A watertight mesh missing half the model is worse than a complete mesh with holes.
     """
     if result_mesh is None or len(result_mesh.faces) == 0:
         return -1
@@ -523,34 +525,83 @@ def _score_result(result_mesh, original_mesh):
     orig_faces = len(original_mesh.faces)
     result_faces = len(result_mesh.faces)
 
-    # HARD GATE: reject any result that lost >40% of faces
-    if orig_faces > 0:
-        face_ratio = result_faces / orig_faces
-        if face_ratio < 0.60:
-            return -1  # Reject — too much geometry destroyed
-
-    # Also reject if bounding box shrank drastically
-    orig_bbox = np.prod(original_mesh.bounds[1] - original_mesh.bounds[0])
+    # Bounding box check (applies to ALL strategies)
+    orig_bbox_dims = original_mesh.bounds[1] - original_mesh.bounds[0]
+    orig_bbox = np.prod(orig_bbox_dims)
+    bbox_ratio = 1.0
     if orig_bbox > 1e-10 and len(result_mesh.faces) > 0:
-        result_bbox = np.prod(result_mesh.bounds[1] - result_mesh.bounds[0])
+        result_bbox_dims = result_mesh.bounds[1] - result_mesh.bounds[0]
+        result_bbox = np.prod(result_bbox_dims)
         bbox_ratio = result_bbox / orig_bbox
-        if bbox_ratio < 0.50:
-            return -1  # Reject — model got cut in half
+        # Per-axis check — reject if any axis shrank below 50%
+        axis_ratios = result_bbox_dims / (orig_bbox_dims + 1e-10)
+        if min(axis_ratios) < 0.40:
+            return -1  # Model got cut along an axis
+
+    if volumetric:
+        # ── Volumetric scoring: shape preservation, not face preservation ──
+        score = 0
+
+        # Watertight: 40 points (most important for volumetric)
+        if result_mesh.is_watertight:
+            score += 40
+
+        # Bounding box preservation: up to 30 points
+        if bbox_ratio >= 0.90:
+            score += 30
+        elif bbox_ratio >= 0.80:
+            score += 25
+        elif bbox_ratio >= 0.70:
+            score += 20
+        elif bbox_ratio >= 0.50:
+            score += 10
+
+        # Volume validity: up to 20 points
+        try:
+            if result_mesh.is_volume and result_mesh.volume > 0:
+                score += 20
+            elif result_mesh.is_watertight:
+                score += 10
+        except:
+            pass
+
+        # Manifold check: 10 points
+        try:
+            mm = manifold3d.Mesh(
+                vert_properties=np.array(result_mesh.vertices, dtype=np.float64),
+                tri_verts=np.array(result_mesh.faces, dtype=np.uint32)
+            )
+            mf = manifold3d.Manifold(mm)
+            if mf.status() == manifold3d.Error.NoError:
+                score += 10
+        except:
+            pass
+
+        return score
+
+    # ── Topology scoring: face preservation matters ──
+    face_ratio = result_faces / orig_faces if orig_faces > 0 else 1.0
+
+    # HARD GATE: reject any result that lost >40% of faces
+    if orig_faces > 0 and face_ratio < 0.60:
+        return -1  # Reject — too much geometry destroyed
+
+    if bbox_ratio < 0.50:
+        return -1  # Reject — model got cut in half
 
     score = 0
 
     # Face preservation: up to 40 points (most important!)
-    if orig_faces > 0:
-        if face_ratio >= 0.95:
-            score += 40
-        elif face_ratio >= 0.90:
-            score += 35
-        elif face_ratio >= 0.80:
-            score += 25
-        elif face_ratio >= 0.70:
-            score += 15
-        elif face_ratio >= 0.60:
-            score += 5
+    if face_ratio >= 0.95:
+        score += 40
+    elif face_ratio >= 0.90:
+        score += 35
+    elif face_ratio >= 0.80:
+        score += 25
+    elif face_ratio >= 0.70:
+        score += 15
+    elif face_ratio >= 0.60:
+        score += 5
 
     # Watertight: 30 points
     if result_mesh.is_watertight:
@@ -840,48 +891,147 @@ def _strategy_direct_manifold(mesh):
 
 def _strategy_voxel_remesh(mesh):
     """
-    Strategy E (Nuclear Option): Voxelize and reconstruct via marching cubes.
-    Guarantees watertight output by converting surface → volume → surface.
+    Strategy E: Volumetric Reconstruction (Meshmixer "Make Solid" approach).
 
-    Tradeoff: fine detail is smoothed out. Use only when all other strategies fail.
-    Memory-safe: caps grid at 128^3 max to avoid OOM on 8GB Railway.
+    This is the CORRECT way to fix AI-generated mesh soup:
+    1. Voxelize the mesh into a padded 3D grid
+    2. Fill interior cavities (binary_fill_holes)
+    3. Morphological closing to connect near-touching parts
+    4. Extract clean surface via marching cubes
+    5. Smooth stair-stepping artifacts
+    6. pymeshfix cleanup on MC output (fixes ~0.04% edge artifacts)
+    7. Validate with manifold3d
+
+    Does NOT try to fix existing topology. Throws it away and rebuilds
+    the shape from scratch. This is what Meshmixer and Formware do.
     """
+    try:
+        from skimage import measure as sk_measure
+        from scipy import ndimage as ndi
+    except ImportError:
+        return None, "scikit-image not installed"
+
     try:
         bbox = mesh.bounds[1] - mesh.bounds[0]
         max_dim = max(bbox)
 
-        if max_dim < 1e-6:
+        if max_dim < 1e-10:
             return None, "mesh has zero extent"
 
-        # Cap grid resolution: 128 for large meshes, 100 for very large
         orig_faces = len(mesh.faces)
-        if orig_faces > 200000:
-            grid_res = 80   # ~500K voxels, safe on 8GB
+
+        # Adaptive grid resolution — higher = more detail, more RAM
+        if orig_faces > 500000:
+            grid_res = 256
+        elif orig_faces > 200000:
+            grid_res = 220
         elif orig_faces > 50000:
-            grid_res = 100
+            grid_res = 180
         else:
-            grid_res = 128
+            grid_res = 150
 
         pitch = max_dim / grid_res
 
+        # Step 1: Voxelize
+        logger.info(f"    Voxel: grid={grid_res}, pitch={pitch:.6f}, faces={orig_faces:,}")
         voxels = mesh.voxelized(pitch)
-        result = voxels.marching_cubes
 
-        # Fix coordinates: marching_cubes outputs in voxel space
-        result.apply_transform(voxels.transform)
+        if voxels.matrix.sum() == 0:
+            return None, "voxelization produced empty grid"
 
-        # Smooth voxel stair-stepping
-        trimesh.smoothing.filter_laplacian(result, iterations=3)
+        # Step 2: Fill interior cavities
+        filled = ndi.binary_fill_holes(voxels.matrix)
+
+        # Step 3: Morphological closing to connect near-touching parts
+        struct = ndi.generate_binary_structure(3, 1)
+        filled = ndi.binary_closing(filled, structure=struct, iterations=1)
+
+        # Step 4: Pad grid so marching cubes has clean boundary (no edge artifacts)
+        filled = np.pad(filled, pad_width=2, mode='constant', constant_values=0)
+
+        # Step 5: Marching cubes
+        try:
+            verts_mc, faces_mc, _, _ = sk_measure.marching_cubes(
+                filled.astype(float),
+                level=0.5,
+                spacing=(pitch, pitch, pitch)
+            )
+        except Exception as e:
+            return None, f"marching cubes failed: {e}"
+
+        if len(verts_mc) == 0 or len(faces_mc) == 0:
+            return None, "marching cubes returned empty mesh"
+
+        # Step 6: Transform back to original coordinate space (undo padding offset)
+        verts_mc -= 2 * pitch
+        verts_mc += mesh.bounds[0]
+
+        result = trimesh.Trimesh(vertices=verts_mc, faces=faces_mc, process=True)
+
+        # Step 7: Smooth stair-stepping
+        try:
+            trimesh.smoothing.filter_laplacian(result, iterations=3, lamb=0.3)
+        except:
+            pass
+
+        # Step 8: Fix normals
+        try:
+            trimesh.repair.fix_normals(result)
+        except:
+            pass
+
+        # Step 9: pymeshfix cleanup on MC output
+        # MC has minor artifacts (~0.04% non-manifold edges). pymeshfix handles
+        # this trivially because the mesh is 99.9% clean already.
+        try:
+            fixer = pymeshfix.MeshFix(
+                np.array(result.vertices, dtype=np.float64),
+                np.array(result.faces, dtype=np.int32)
+            )
+            fixer.repair()
+            cleaned = trimesh.Trimesh(
+                vertices=np.array(fixer.points),
+                faces=np.array(fixer.faces),
+                process=True
+            )
+            # Only use pymeshfix result if it didn't destroy the MC output
+            if len(cleaned.faces) >= len(result.faces) * 0.50:
+                result = cleaned
+        except:
+            pass  # Keep the MC result as-is
 
         if not result.is_watertight or len(result.faces) == 0:
-            return None, "voxel remesh did not produce watertight result"
+            return None, "voxel reconstruction not watertight"
 
-        return result, f"voxel shrink-wrap (grid={grid_res}, pitch={pitch:.3f})"
+        # Step 10: Validate with manifold3d
+        try:
+            mm = manifold3d.Mesh(
+                vert_properties=np.array(result.vertices, dtype=np.float64),
+                tri_verts=np.array(result.faces, dtype=np.uint32)
+            )
+            mf = manifold3d.Manifold(mm)
+            if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                out = mf.to_mesh()
+                result = trimesh.Trimesh(
+                    vertices=np.array(out.vert_properties)[:, :3],
+                    faces=np.array(out.tri_verts),
+                    process=True
+                )
+        except:
+            pass
+
+        # Verify bounding box preserved
+        result_bbox = result.bounds[1] - result.bounds[0]
+        axis_ratios = result_bbox / (bbox + 1e-10)
+        if min(axis_ratios) < 0.40:
+            return None, f"voxel reconstruction lost shape (min axis ratio={min(axis_ratios):.2f})"
+
+        return result, f"volumetric reconstruction (grid={grid_res}, {len(result.faces):,} faces)"
 
     except MemoryError:
-        return None, "voxel remesh OOM"
+        return None, "voxel reconstruction OOM"
     except Exception as e:
-        return None, f"voxel remesh failed: {e}"
+        return None, f"voxel reconstruction failed: {e}"
 
 
 def _strategy_poisson_reconstruct(mesh):
@@ -1052,14 +1202,14 @@ def repair_mesh(mesh, analysis):
         results = []
         pymeshfix_last_resort = None  # Saved even with high geometry loss
 
-        def _try_strategy(name, fn):
+        def _try_strategy(name, fn, volumetric=False):
             """Run a strategy, score it, add to results. Returns score."""
             try:
                 t_strat = time.time()
                 result_mesh, desc = fn(_make_input())
                 dt = time.time() - t_strat
                 if result_mesh is not None and len(result_mesh.faces) > 0:
-                    score = _score_result(result_mesh, mesh)
+                    score = _score_result(result_mesh, mesh, volumetric=volumetric)
                     logger.info(f"  [{_elapsed():.1f}s] {name}: score={score}, "
                                 f"faces={len(result_mesh.faces):,}, "
                                 f"watertight={result_mesh.is_watertight}, "
@@ -1078,86 +1228,93 @@ def repair_mesh(mesh, analysis):
 
         # PHASE 2a: Fast strategies first (< 5s each)
         _try_strategy("direct_manifold", _strategy_direct_manifold)
-        score_bu = _try_strategy("boolean_union", _strategy_boolean_union)
+        _try_strategy("boolean_union", _strategy_boolean_union)
 
         # Short-circuit: if we already have a great result, skip slow strategies
         best_so_far = max((r[0] for r in results), default=-1)
         if best_so_far >= 80:
             logger.info(f"  [{_elapsed():.1f}s] Fast strategy scored {best_so_far} — skipping slow strategies")
         else:
-            # PHASE 2b: pymeshfix (expensive — 60-120s on large meshes)
-            # Run ONCE and reuse result for both pymeshfix and pymeshfix+manifold
-            logger.info(f"  [{_elapsed():.1f}s] Running pymeshfix (may take 1-2 min)...")
-            pymeshfix_result = None
-            try:
-                t_pmf = time.time()
-                orig_faces_count = len(safe_faces)
-                fixer = pymeshfix.MeshFix(safe_verts.copy(), safe_faces.copy())
-                fixer.repair()
-                pmf_verts = np.array(fixer.points)
-                pmf_faces = np.array(fixer.faces)
-                dt_pmf = time.time() - t_pmf
+            nm_count = stats.get('non_manifold_edges', 0)
+            is_large_broken = (len(safe_faces) > 50000 and nm_count > 500)
+            skip_pymeshfix = False
 
-                if len(pmf_verts) > 0 and len(pmf_faces) > 0:
-                    pymeshfix_result = trimesh.Trimesh(vertices=pmf_verts, faces=pmf_faces, process=True)
+            # PHASE 2b: For large broken meshes, try volumetric reconstruction FIRST
+            # This is what Meshmixer/Formware do — rebuild shape from scratch
+            if is_large_broken:
+                logger.info(f"  [{_elapsed():.1f}s] Large broken mesh ({len(safe_faces):,} faces, {nm_count} nm) — volumetric reconstruction...")
+                voxel_score = _try_strategy("voxel_reconstruct", _strategy_voxel_remesh, volumetric=True)
+                if voxel_score >= 60:
+                    logger.info(f"  [{_elapsed():.1f}s] Voxel scored {voxel_score} — skipping pymeshfix")
+                    skip_pymeshfix = True
 
-                    # Safety check — but save as last resort even if rejected
-                    if len(pymeshfix_result.faces) < orig_faces_count * 0.30:
-                        logger.info(f"  [{_elapsed():.1f}s] pymeshfix high geometry loss "
-                                    f"({orig_faces_count:,} → {len(pymeshfix_result.faces):,}) — saved as last resort")
-                        pymeshfix_last_resort = pymeshfix_result  # Save for emergency use
-                        pymeshfix_result = None
-                    else:
-                        logger.info(f"  [{_elapsed():.1f}s] pymeshfix done: {len(pymeshfix_result.faces):,} faces, "
-                                    f"watertight={pymeshfix_result.is_watertight}, {dt_pmf:.1f}s")
-            except RepairTimeout:
-                raise
-            except Exception as e:
-                logger.warning(f"  [{_elapsed():.1f}s] pymeshfix CRASH: {e}")
-
-            if pymeshfix_result is not None:
-                # Score pymeshfix result
-                pmf_score = _score_result(pymeshfix_result, mesh)
-                if pmf_score >= 0:
-                    results.append((pmf_score, pymeshfix_result, "pymeshfix",
-                                    f"pymeshfix full repair ({len(pymeshfix_result.faces):,} faces)"))
-                    logger.info(f"  [{_elapsed():.1f}s] pymeshfix: score={pmf_score}")
-
-                # Try manifold3d on pymeshfix result (fast, <1s)
+            # PHASE 2c: pymeshfix (skip for large broken meshes if voxel worked)
+            if not skip_pymeshfix:
+                logger.info(f"  [{_elapsed():.1f}s] Running pymeshfix (may take 1-2 min)...")
+                pymeshfix_result = None
                 try:
-                    mm = manifold3d.Mesh(
-                        vert_properties=np.array(pymeshfix_result.vertices, dtype=np.float64),
-                        tri_verts=np.array(pymeshfix_result.faces, dtype=np.uint32)
-                    )
-                    mf = manifold3d.Manifold(mm)
-                    if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
-                        out = mf.to_mesh()
-                        manifold_result = trimesh.Trimesh(
-                            vertices=np.array(out.vert_properties)[:, :3],
-                            faces=np.array(out.tri_verts),
-                            process=True
-                        )
-                        mfm_score = _score_result(manifold_result, mesh)
-                        if mfm_score >= 0:
-                            results.append((mfm_score, manifold_result, "pymeshfix+manifold",
-                                            "pymeshfix + manifold validated"))
-                            logger.info(f"  [{_elapsed():.1f}s] pymeshfix+manifold: score={mfm_score}")
+                    t_pmf = time.time()
+                    orig_faces_count = len(safe_faces)
+                    fixer = pymeshfix.MeshFix(safe_verts.copy(), safe_faces.copy())
+                    fixer.repair()
+                    pmf_verts = np.array(fixer.points)
+                    pmf_faces = np.array(fixer.faces)
+                    dt_pmf = time.time() - t_pmf
+
+                    if len(pmf_verts) > 0 and len(pmf_faces) > 0:
+                        pymeshfix_result = trimesh.Trimesh(vertices=pmf_verts, faces=pmf_faces, process=True)
+
+                        # Safety check — but save as last resort even if rejected
+                        if len(pymeshfix_result.faces) < orig_faces_count * 0.30:
+                            logger.info(f"  [{_elapsed():.1f}s] pymeshfix high geometry loss "
+                                        f"({orig_faces_count:,} → {len(pymeshfix_result.faces):,}) — saved as last resort")
+                            pymeshfix_last_resort = pymeshfix_result  # Save for emergency use
+                            pymeshfix_result = None
+                        else:
+                            logger.info(f"  [{_elapsed():.1f}s] pymeshfix done: {len(pymeshfix_result.faces):,} faces, "
+                                        f"watertight={pymeshfix_result.is_watertight}, {dt_pmf:.1f}s")
                 except RepairTimeout:
                     raise
                 except Exception as e:
-                    logger.warning(f"  [{_elapsed():.1f}s] manifold on pymeshfix result: {e}")
+                    logger.warning(f"  [{_elapsed():.1f}s] pymeshfix CRASH: {e}")
 
-            # PHASE 2c: Poisson reconstruction (if nothing worked well)
-            # Reconstructs surface from point cloud — handles soup meshes
-            best_so_far = max((r[0] for r in results), default=-1)
-            if best_so_far < 70:
-                logger.info(f"  [{_elapsed():.1f}s] Best score {best_so_far} < 70 — trying Poisson reconstruction...")
-                _try_strategy("poisson", _strategy_poisson_reconstruct)
+                if pymeshfix_result is not None:
+                    # Score pymeshfix result
+                    pmf_score = _score_result(pymeshfix_result, mesh)
+                    if pmf_score >= 0:
+                        results.append((pmf_score, pymeshfix_result, "pymeshfix",
+                                        f"pymeshfix full repair ({len(pymeshfix_result.faces):,} faces)"))
+                        logger.info(f"  [{_elapsed():.1f}s] pymeshfix: score={pmf_score}")
 
-            # PHASE 2d: Voxel remesh (last resort — if even Poisson failed)
+                    # Try manifold3d on pymeshfix result (fast, <1s)
+                    try:
+                        mm = manifold3d.Mesh(
+                            vert_properties=np.array(pymeshfix_result.vertices, dtype=np.float64),
+                            tri_verts=np.array(pymeshfix_result.faces, dtype=np.uint32)
+                        )
+                        mf = manifold3d.Manifold(mm)
+                        if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                            out = mf.to_mesh()
+                            manifold_result = trimesh.Trimesh(
+                                vertices=np.array(out.vert_properties)[:, :3],
+                                faces=np.array(out.tri_verts),
+                                process=True
+                            )
+                            mfm_score = _score_result(manifold_result, mesh)
+                            if mfm_score >= 0:
+                                results.append((mfm_score, manifold_result, "pymeshfix+manifold",
+                                                "pymeshfix + manifold validated"))
+                                logger.info(f"  [{_elapsed():.1f}s] pymeshfix+manifold: score={mfm_score}")
+                    except RepairTimeout:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"  [{_elapsed():.1f}s] manifold on pymeshfix result: {e}")
+
+            # PHASE 2d: Voxel reconstruction as fallback (for smaller meshes that weren't caught above)
             best_so_far = max((r[0] for r in results), default=-1)
-            if best_so_far < 50:
-                _try_strategy("voxel_remesh", _strategy_voxel_remesh)
+            if best_so_far < 50 and not is_large_broken:
+                logger.info(f"  [{_elapsed():.1f}s] Best score {best_so_far} < 50 — trying volumetric reconstruction...")
+                _try_strategy("voxel_reconstruct", _strategy_voxel_remesh, volumetric=True)
 
         # ════════════════════════════════════════════
         # PHASE 3: Pick the best result

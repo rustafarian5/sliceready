@@ -8,3 +8,4 @@ stripe==11.4.1
 scipy==1.15.2
 networkx==3.2.1
 rtree==1.4.1
+scikit-image==0.25.2
