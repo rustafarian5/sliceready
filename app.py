@@ -921,14 +921,14 @@ def _strategy_voxel_remesh(mesh):
         orig_faces = len(mesh.faces)
 
         # Adaptive grid resolution — higher = more detail, more RAM
-        # 256³ = 16M voxels (~130MB), 320³ = 32M (~260MB)
-        # Railway has 8GB — safe up to 320³
+        # 256³ = 16M voxels (~130MB with scipy ops) — safe for Railway
+        # 320³ = 32M voxels (~260MB) — OOMs on Railway for 600K+ face meshes
         if orig_faces > 500000:
-            grid_res = 320
+            grid_res = 256
         elif orig_faces > 200000:
-            grid_res = 280
+            grid_res = 256
         elif orig_faces > 50000:
-            grid_res = 220
+            grid_res = 200
         else:
             grid_res = 150
 
