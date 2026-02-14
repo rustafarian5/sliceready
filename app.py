@@ -1050,6 +1050,7 @@ def repair_mesh(mesh, analysis):
             return trimesh.Trimesh(vertices=safe_verts.copy(), faces=safe_faces.copy(), process=False)
 
         results = []
+        pymeshfix_last_resort = None  # Saved even with high geometry loss
 
         def _try_strategy(name, fn):
             """Run a strategy, score it, add to results. Returns score."""
@@ -1100,10 +1101,11 @@ def repair_mesh(mesh, analysis):
                 if len(pmf_verts) > 0 and len(pmf_faces) > 0:
                     pymeshfix_result = trimesh.Trimesh(vertices=pmf_verts, faces=pmf_faces, process=True)
 
-                    # Safety check
+                    # Safety check — but save as last resort even if rejected
                     if len(pymeshfix_result.faces) < orig_faces_count * 0.30:
-                        logger.info(f"  [{_elapsed():.1f}s] pymeshfix destroyed geometry "
-                                    f"({orig_faces_count:,} → {len(pymeshfix_result.faces):,}) — rejected")
+                        logger.info(f"  [{_elapsed():.1f}s] pymeshfix high geometry loss "
+                                    f"({orig_faces_count:,} → {len(pymeshfix_result.faces):,}) — saved as last resort")
+                        pymeshfix_last_resort = pymeshfix_result  # Save for emergency use
                         pymeshfix_result = None
                     else:
                         logger.info(f"  [{_elapsed():.1f}s] pymeshfix done: {len(pymeshfix_result.faces):,} faces, "
@@ -1174,9 +1176,34 @@ def repair_mesh(mesh, analysis):
                 repairs.append("Cleanup was the best result")
                 logger.info(f"  Winner: cleanup (score={cleaned_score} >= best={best_score})")
         else:
-            mesh = cleaned_mesh
-            repairs.append("All repair strategies failed — returning cleaned mesh")
-            logger.warning("  No repair strategy succeeded")
+            # Last resort: use pymeshfix result even with high geometry loss
+            # A watertight mesh with fewer faces is better than a broken mesh Bambu rejects
+            if pymeshfix_last_resort is not None and pymeshfix_last_resort.is_watertight:
+                # Try manifold validation on last resort too
+                try:
+                    mm = manifold3d.Mesh(
+                        vert_properties=np.array(pymeshfix_last_resort.vertices, dtype=np.float64),
+                        tri_verts=np.array(pymeshfix_last_resort.faces, dtype=np.uint32)
+                    )
+                    mf = manifold3d.Manifold(mm)
+                    if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                        out = mf.to_mesh()
+                        pymeshfix_last_resort = trimesh.Trimesh(
+                            vertices=np.array(out.vert_properties)[:, :3],
+                            faces=np.array(out.tri_verts),
+                            process=True
+                        )
+                        logger.info(f"  [{_elapsed():.1f}s] Last resort manifold-validated")
+                except:
+                    pass
+                mesh = pymeshfix_last_resort
+                pct = len(mesh.faces) / original_faces * 100
+                repairs.append(f"⚠ pymeshfix last resort ({len(mesh.faces):,} faces, {pct:.0f}% of original — geometry simplified)")
+                logger.info(f"  Winner: pymeshfix last resort ({len(mesh.faces):,} faces, {pct:.0f}%)")
+            else:
+                mesh = cleaned_mesh
+                repairs.append("All repair strategies failed — returning cleaned mesh")
+                logger.warning("  No repair strategy succeeded")
 
         # Final normal fix
         try:
@@ -1221,30 +1248,26 @@ def repair_mesh(mesh, analysis):
                         bad_edges = set(unique_edges[edge_counts != 2].tolist())
 
                         if bad_edges:
-                            # Find faces that contain bad edges
-                            face_edge_keys = []
-                            for face in mesh.faces:
-                                sf = sorted(face)
-                                keys = [
-                                    sf[0] * (len(mesh.vertices) + 1) + sf[1],
-                                    sf[0] * (len(mesh.vertices) + 1) + sf[2],
-                                    sf[1] * (len(mesh.vertices) + 1) + sf[2],
-                                ]
-                                face_edge_keys.append(keys)
+                            # VECTORIZED: compute all face edge keys with numpy
+                            sf = np.sort(mesh.faces, axis=1)  # sort vertex indices per face
+                            nv = len(mesh.vertices) + 1
+                            fek0 = sf[:, 0] * nv + sf[:, 1]  # edge 0-1
+                            fek1 = sf[:, 0] * nv + sf[:, 2]  # edge 0-2
+                            fek2 = sf[:, 1] * nv + sf[:, 2]  # edge 1-2
 
-                            # For each bad edge, keep only the 2 largest faces, remove extras
+                            # For each bad edge, find faces containing it and keep only 2 largest
                             bad_face_indices = set()
-                            for bad_ek in bad_edges:
-                                faces_with_edge = []
-                                for fi, fkeys in enumerate(face_edge_keys):
-                                    if bad_ek in fkeys:
-                                        faces_with_edge.append(fi)
-                                if len(faces_with_edge) > 2:
-                                    # Keep the 2 with largest area, remove rest
-                                    areas = mesh.area_faces[faces_with_edge]
-                                    sorted_idx = np.argsort(areas)[::-1]
+                            areas = mesh.area_faces
+                            bad_edges_arr = np.array(list(bad_edges))
+
+                            for bad_ek in bad_edges_arr:
+                                mask = (fek0 == bad_ek) | (fek1 == bad_ek) | (fek2 == bad_ek)
+                                face_indices = np.where(mask)[0]
+                                if len(face_indices) > 2:
+                                    face_areas = areas[face_indices]
+                                    sorted_idx = np.argsort(face_areas)[::-1]
                                     for idx in sorted_idx[2:]:
-                                        bad_face_indices.add(faces_with_edge[idx])
+                                        bad_face_indices.add(face_indices[idx])
 
                             if bad_face_indices:
                                 keep = np.ones(len(mesh.faces), dtype=bool)
