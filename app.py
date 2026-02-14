@@ -3042,11 +3042,25 @@ def api_v1_orient():
 @app.route('/api/download/<job_id>', methods=['GET'])
 def download(job_id):
     """Download repaired file. Free during beta."""
-    if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
+    output_format = request.args.get('format', 'stl').lower()
 
-    job = jobs[job_id]
-    mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+    # Try in-memory job first
+    if job_id in jobs:
+        job = jobs[job_id]
+        mesh_path = job.get('repaired_path') if job['repaired'] else job['original_path']
+        base_name = os.path.splitext(job.get('original_name', 'model'))[0]
+    else:
+        # Worker restarted — check disk for repaired file
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], f"{job_id}_repaired.stl")
+        original_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        if os.path.exists(repaired_path):
+            mesh_path = repaired_path
+        elif os.path.exists(original_path):
+            mesh_path = original_path
+        else:
+            return jsonify({'error': 'Job not found'}), 404
+        base_name = 'model'
+
     if not mesh_path or not os.path.exists(mesh_path):
         return jsonify({'error': 'File not found on server'}), 404
 
