@@ -363,9 +363,10 @@ def analyze_mesh(mesh):
 
     # ── Inverted / inconsistent normals ──
     if not mesh.is_watertight:
-        # Check face winding consistency
-        # trimesh can detect this via broken faces
-        broken = mesh.faces[trimesh.repair.broken_faces(mesh)] if hasattr(trimesh.repair, 'broken_faces') else []
+        try:
+            broken = mesh.faces[trimesh.repair.broken_faces(mesh)] if hasattr(trimesh.repair, 'broken_faces') else []
+        except:
+            broken = []
         if hasattr(mesh, 'face_adjacency_unshared'):
             pass  # trimesh handles this internally
         issues.append({
@@ -1182,6 +1183,131 @@ def repair_mesh(mesh, analysis):
             trimesh.repair.fix_normals(mesh)
         except:
             pass
+
+        # ════════════════════════════════════════════
+        # PHASE 4: Final Bambu-compatible validation
+        # Bambu Studio rejects ANY non-manifold edges.
+        # trimesh may say "watertight" but still have them.
+        # ════════════════════════════════════════════
+        try:
+            edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+            edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+            _, edge_counts = np.unique(edge_keys, return_counts=True)
+            remaining_nm = int(np.sum(edge_counts != 2))
+
+            if remaining_nm > 0:
+                logger.info(f"  [{_elapsed():.1f}s] Final check: {remaining_nm} non-manifold edges remain — attempting emergency fix")
+
+                # Emergency fix 1: merge close vertices and remove degenerate faces
+                try:
+                    mesh.merge_vertices(merge_tex=True, merge_norm=True)
+                    mesh.remove_degenerate_faces()
+                    mesh.remove_duplicate_faces()
+
+                    # Recheck
+                    edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+                    edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+                    _, edge_counts = np.unique(edge_keys, return_counts=True)
+                    remaining_nm = int(np.sum(edge_counts != 2))
+                except:
+                    pass
+
+                if remaining_nm > 0:
+                    # Emergency fix 2: identify and remove non-manifold faces directly
+                    try:
+                        edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+                        edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+                        unique_edges, edge_counts = np.unique(edge_keys, return_counts=True)
+                        bad_edges = set(unique_edges[edge_counts != 2].tolist())
+
+                        if bad_edges:
+                            # Find faces that contain bad edges
+                            face_edge_keys = []
+                            for face in mesh.faces:
+                                sf = sorted(face)
+                                keys = [
+                                    sf[0] * (len(mesh.vertices) + 1) + sf[1],
+                                    sf[0] * (len(mesh.vertices) + 1) + sf[2],
+                                    sf[1] * (len(mesh.vertices) + 1) + sf[2],
+                                ]
+                                face_edge_keys.append(keys)
+
+                            # For each bad edge, keep only the 2 largest faces, remove extras
+                            bad_face_indices = set()
+                            for bad_ek in bad_edges:
+                                faces_with_edge = []
+                                for fi, fkeys in enumerate(face_edge_keys):
+                                    if bad_ek in fkeys:
+                                        faces_with_edge.append(fi)
+                                if len(faces_with_edge) > 2:
+                                    # Keep the 2 with largest area, remove rest
+                                    areas = mesh.area_faces[faces_with_edge]
+                                    sorted_idx = np.argsort(areas)[::-1]
+                                    for idx in sorted_idx[2:]:
+                                        bad_face_indices.add(faces_with_edge[idx])
+
+                            if bad_face_indices:
+                                keep = np.ones(len(mesh.faces), dtype=bool)
+                                for fi in bad_face_indices:
+                                    keep[fi] = False
+                                removed = int(np.sum(~keep))
+                                mesh.update_faces(keep)
+                                mesh.remove_unreferenced_vertices()
+                                repairs.append(f"Removed {removed} non-manifold faces (Bambu compatibility)")
+                                logger.info(f"  [{_elapsed():.1f}s] Removed {removed} non-manifold faces")
+                    except Exception as e:
+                        logger.warning(f"  [{_elapsed():.1f}s] Non-manifold face removal failed: {e}")
+
+                    # Emergency fix 3: if STILL broken, run pymeshfix one more time
+                    edges_sorted = np.sort(mesh.edges_sorted, axis=1)
+                    edge_keys = edges_sorted[:, 0] * (len(mesh.vertices) + 1) + edges_sorted[:, 1]
+                    _, edge_counts = np.unique(edge_keys, return_counts=True)
+                    remaining_nm = int(np.sum(edge_counts != 2))
+
+                    if remaining_nm > 0:
+                        try:
+                            logger.info(f"  [{_elapsed():.1f}s] Still {remaining_nm} nm edges — final pymeshfix pass")
+                            fixer = pymeshfix.MeshFix(
+                                np.array(mesh.vertices, dtype=np.float64),
+                                np.array(mesh.faces, dtype=np.int32)
+                            )
+                            fixer.repair()
+                            pmf_v = np.array(fixer.points)
+                            pmf_f = np.array(fixer.faces)
+                            if len(pmf_v) > 0 and len(pmf_f) > 0:
+                                candidate = trimesh.Trimesh(vertices=pmf_v, faces=pmf_f, process=True)
+                                if len(candidate.faces) >= len(mesh.faces) * 0.60:
+                                    mesh = candidate
+                                    repairs.append("Emergency pymeshfix pass (non-manifold cleanup)")
+                        except:
+                            pass
+
+            # Final manifold3d stamp
+            try:
+                mm = manifold3d.Mesh(
+                    vert_properties=np.array(mesh.vertices, dtype=np.float64),
+                    tri_verts=np.array(mesh.faces, dtype=np.uint32)
+                )
+                mf = manifold3d.Manifold(mm)
+                if mf.status() == manifold3d.Error.NoError and mf.num_tri() > 0:
+                    out = mf.to_mesh()
+                    mf_mesh = trimesh.Trimesh(
+                        vertices=np.array(out.vert_properties)[:, :3],
+                        faces=np.array(out.tri_verts),
+                        process=True
+                    )
+                    if len(mf_mesh.faces) >= len(mesh.faces) * 0.60:
+                        mesh = mf_mesh
+                        repairs.append("✓ Manifold-validated (Bambu/PrusaSlicer compatible)")
+                    else:
+                        repairs.append("⚠ Manifold validation reduced geometry — kept pre-validation result")
+                else:
+                    repairs.append(f"⚠ Manifold validation: {mf.status()} — slicer may show warnings")
+            except Exception as e:
+                repairs.append(f"⚠ Manifold validation skipped: {e}")
+
+        except Exception as e:
+            logger.warning(f"Final validation error: {e}")
 
     except RepairTimeout:
         elapsed = _elapsed()
