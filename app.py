@@ -2043,7 +2043,44 @@ def workspace():
 def get_job(job_id):
     """Return job data for a previously uploaded file."""
     if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
+        # Worker restarted — try to recover from disk
+        original_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], f"{job_id}_repaired.stl")
+
+        if os.path.exists(repaired_path):
+            mesh_path = repaired_path
+            is_repaired = True
+        elif os.path.exists(original_path):
+            mesh_path = original_path
+            is_repaired = False
+        else:
+            return jsonify({'error': 'Job not found'}), 404
+
+        mesh = trimesh.load(mesh_path, file_type='stl', force='mesh')
+        mesh_data = mesh_to_json(mesh)
+        analysis = analyze_mesh(mesh)
+
+        # Rebuild job in memory
+        jobs[job_id] = {
+            'original_path': original_path if os.path.exists(original_path) else mesh_path,
+            'original_name': f"{job_id}.stl",
+            'file_size': os.path.getsize(mesh_path),
+            'analysis': analysis,
+            'repaired': is_repaired,
+            'repaired_path': repaired_path if is_repaired else None,
+            'created_at': datetime.utcnow().isoformat(),
+            'paid': False
+        }
+
+        return jsonify({
+            'job_id': job_id,
+            'original_name': f"{job_id}.stl",
+            'file_size': os.path.getsize(mesh_path),
+            'analysis': analysis,
+            'mesh_data': mesh_data,
+            'repaired': is_repaired
+        })
+
     job = jobs[job_id]
 
     # Load mesh data
@@ -2126,7 +2163,37 @@ def repair(job_id):
     # Track usage if logged in, but don't block if not
     
     if job_id not in jobs:
-        return jsonify({'error': 'Job not found'}), 404
+        # Worker restarted — try to recover from disk
+        original_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.stl")
+        repaired_path = os.path.join(app.config['REPAIRED_FOLDER'], f"{job_id}_repaired.stl")
+
+        if os.path.exists(repaired_path):
+            # Already repaired, just return it
+            mesh = trimesh.load(repaired_path, file_type='stl', force='mesh')
+            mesh_data = mesh_to_json(mesh)
+            reanalysis = analyze_mesh(mesh)
+            return jsonify({
+                'job_id': job_id,
+                'repairs': ['Recovered from previous repair session'],
+                'mesh_data': mesh_data,
+                'analysis': reanalysis
+            })
+        elif os.path.exists(original_path):
+            # Rebuild job from disk and continue to repair
+            mesh = trimesh.load(original_path, file_type='stl', force='mesh')
+            analysis = analyze_mesh(mesh)
+            jobs[job_id] = {
+                'original_path': original_path,
+                'original_name': f"{job_id}.stl",
+                'file_size': os.path.getsize(original_path),
+                'analysis': analysis,
+                'repaired': False,
+                'repaired_path': None,
+                'created_at': datetime.utcnow().isoformat(),
+                'paid': False
+            }
+        else:
+            return jsonify({'error': 'Job not found'}), 404
 
     job = jobs[job_id]
 
