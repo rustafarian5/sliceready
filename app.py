@@ -921,12 +921,14 @@ def _strategy_voxel_remesh(mesh):
         orig_faces = len(mesh.faces)
 
         # Adaptive grid resolution — higher = more detail, more RAM
+        # 256³ = 16M voxels (~130MB), 320³ = 32M (~260MB)
+        # Railway has 8GB — safe up to 320³
         if orig_faces > 500000:
-            grid_res = 256
+            grid_res = 320
         elif orig_faces > 200000:
-            grid_res = 220
+            grid_res = 280
         elif orig_faces > 50000:
-            grid_res = 180
+            grid_res = 220
         else:
             grid_res = 150
 
@@ -970,7 +972,7 @@ def _strategy_voxel_remesh(mesh):
 
         # Step 7: Smooth stair-stepping
         try:
-            trimesh.smoothing.filter_laplacian(result, iterations=3, lamb=0.3)
+            trimesh.smoothing.filter_laplacian(result, iterations=2, lamb=0.15)
         except:
             pass
 
@@ -1025,6 +1027,17 @@ def _strategy_voxel_remesh(mesh):
         axis_ratios = result_bbox / (bbox + 1e-10)
         if min(axis_ratios) < 0.40:
             return None, f"voxel reconstruction lost shape (min axis ratio={min(axis_ratios):.2f})"
+
+        # Step 11: Decimate if face count inflated beyond original
+        target_faces = min(orig_faces, 500000)
+        if len(result.faces) > target_faces * 1.2:
+            try:
+                decimated = result.simplify_quadric_decimation(face_count=target_faces)
+                if decimated.is_watertight and len(decimated.faces) > 0:
+                    result = decimated
+                    logger.info(f"    Decimated: {len(result.faces):,} faces (target {target_faces:,})")
+            except Exception as e:
+                logger.warning(f"    Decimation skipped: {e}")
 
         return result, f"volumetric reconstruction (grid={grid_res}, {len(result.faces):,} faces)"
 
